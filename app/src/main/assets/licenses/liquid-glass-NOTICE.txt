@@ -1,0 +1,17 @@
+UltraDSU liquid-glass navigation
+
+Reference: Baka-SU/BakaSU, manager/.../component/FloatingBottomBar.kt
+Reference commit: 896e8981e0ed76ec14d1dcb39ab793438b304886
+https://github.com/Baka-SU/BakaSU
+
+Lens shader source: compose-miuix-ui/miuix, example/shared/src/commonMain/kotlin/component/liquid/Lens.kt
+Source commit: 17138ef67967e6d57d3cee03893964d85b25afbd
+Copyright 2026, compose-miuix-ui contributors
+SPDX-License-Identifier: Apache-2.0
+https://github.com/compose-miuix-ui/miuix
+Adapted by that project from Kyant0/AndroidLiquidGlass (Apache-2.0):
+https://github.com/Kyant0/AndroidLiquidGlass
+
+UltraDSU modifications: API-gated native RenderEffect/RuntimeShader integration,
+independent backdrop sampling and compact navigation gestures for API 29+.
+Apache-2.0 license text: liquid-glass-Apache-2.0.txt

@@ -1,0 +1,5 @@
+<resources>
+    <!-- Android 12+: separate wallpaper-derived background and foreground colors. -->
+    <color name="ic_launcher_paper">@android:color/system_accent1_100</color>
+    <color name="ic_launcher_ink">@android:color/system_accent1_700</color>
+</resources>
