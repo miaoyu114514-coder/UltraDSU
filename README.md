@@ -2,7 +2,7 @@
 
 基于 Android DSU（Dynamic System Updates）的原生 Android 应用。最低 Android 10 / API 29，Kotlin + Jetpack Compose。
 
-当前预发布版本：**0.2.8-alpha.2**。[下载 Release](https://github.com/miaoyu114514-coder/UltraDSU/releases) · [Alpha 说明](docs/releases/v0.2.8-alpha.2.md)。私有仓库的下载需要仓库访问权限。
+当前预发布版本：**0.2.8-alpha.2**。[下载 Release](https://github.com/miaoyu114514-coder/UltraDSU/releases) · [Alpha 说明](docs/releases/v0.2.8-alpha.2.md)。仓库已公开，无需登录即可下载测试版。
 
 ## 已实现
 
