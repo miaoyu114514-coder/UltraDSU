@@ -27,8 +27,8 @@ android {
         applicationId = "io.github.ultradsu"
         minSdk = 29
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.2.8-alpha.1"
+        versionCode = 13
+        versionName = "0.2.8-alpha.2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildFeatures { compose = true; buildConfig = true }

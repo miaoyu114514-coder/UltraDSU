@@ -163,13 +163,6 @@ private data class Confirmation(val title: String, val text: String, val action:
                             UCard(Modifier.weight(1f)) { UText("${state.slots.count { it.state == SlotState.INSTALLED }}", 30, true, accent); UText("已核实安装", 13, color = mutedColor) }
                         }
                     }
-                    item {
-                        UCard {
-                            UText("开始一次系统探索", 18, true)
-                            UText("01   导入与你的设备兼容的 GSI\n02   设置槽标识和 userdata 空间\n03   交给系统安装，完成后选择启动", 14, color = mutedColor)
-                            UButton("管理系统槽", onClick = { tab = 1 })
-                        }
-                    }
                 } else if (page == 1) {
                     item {
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -258,12 +251,7 @@ private data class Confirmation(val title: String, val text: String, val action:
                             UText("功能流程参考 DSU Sideloader（Apache-2.0），未包含它的定制 gsid 或系统模块。", 13, color = mutedColor)
                         }
                     }
-                    item { UText("操作记录", 13, true, mutedColor) }
-                    item {
-                        UCard {
-                            SelectionContainer { UText(state.log.ifEmpty { listOf("尚无操作记录") }.joinToString("\n\n"), 12, color = mutedColor) }
-                        }
-                    }
+                    item(key = "maintainers") { MaintainersCard() }
                 }
             }
             }

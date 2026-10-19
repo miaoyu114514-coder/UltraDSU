@@ -129,3 +129,11 @@ SHA-256：
 - apksigner 验证 APK v2 签名有效；aapt 核对 versionName=0.2.8-alpha.1、versionCode=12、无 application-debuggable，包含 arm64-v8a / armeabi-v7a / x86 / x86_64。
 - APK 54,620,408 字节；SHA-256 `a07534f5d9bad2687e54992ccf985f5603e753ad2f7e15a92ec5fb60ccae9fdd`。发布证书 SHA-256 `261f796ec575501160e20c3f3e951369180e38f7e4d2bc5e4a1a2350e830c749`。
 - 源码清单排除工具缓存、历史 APK、设备二进制、签名文件及本机配置；Alpha Release 仅上传通用应用 APK 与独立 SHA256SUMS.txt，未包含实验性 gsid 模块。
+
+## 0.2.8-alpha.2 维护者与页面精简
+
+- 设置页增加 Fish_Neko、GPT-6.1 Sol 的头像和名字，README 共用相同图片资源。图片保留原像素，检查未包含 EXIF、文本或时间元数据。
+- 删除设置页“操作记录”标题及卡片、概览页“开始一次系统探索”卡片，miuix / Material 3 共用更新后的内容。
+- assembleRelease、lintRelease 离线构建通过，lint 0 错误；APK v2 签名校验通过，沿用 Alpha 1 发布证书。此次仅修改展示内容，未重复执行 DSU 业务测试或设备写入测试。
+- aapt 核对版本 0.2.8-alpha.2 / code 13，最低 API 29、目标 API 35、未启用 debuggable，保留四种 ABI。
+- APK 56,823,104 字节；SHA-256 `e17fd757c2bb945ce95da00f5071dcb6d4fcc6f6a59a82331cc21a0829b65c73`。发布附件为 APK 与 SHA256SUMS.txt。

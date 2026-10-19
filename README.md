@@ -2,7 +2,7 @@
 
 基于 Android DSU（Dynamic System Updates）的原生 Android 应用。最低 Android 10 / API 29，Kotlin + Jetpack Compose。
 
-当前预发布版本：**0.2.8-alpha.1**。[下载 Release](https://github.com/miaoyu114514-coder/UltraDSU/releases) · [Alpha 说明](docs/releases/v0.2.8-alpha.1.md)。私有仓库的下载需要仓库访问权限。
+当前预发布版本：**0.2.8-alpha.2**。[下载 Release](https://github.com/miaoyu114514-coder/UltraDSU/releases) · [Alpha 说明](docs/releases/v0.2.8-alpha.2.md)。私有仓库的下载需要仓库访问权限。
 
 ## 已实现
 
@@ -78,6 +78,15 @@ chmod +x gradlew
 - Root 通过 `app_process` 加载当前 APK，在 UID 0 中反射设备自带 AIDL Proxy，不硬编码 Binder transaction 编号。SELinux/厂商接口限制会返回错误，不会自动改 SELinux 或关闭 AVB。
 - Android 11 的 `removeGsi()` 会删除共享启动状态。多槽删除改用槽专属 `IImageService` 删除 backing images，并清除该槽两个注册标记；仅支持标准 AOSP 元数据布局。最后一个槽使用系统原生删除接口。细节见兼容性文档。
 - 本地记录保留完整读写错误；操作日志只保留当前进程最近 100 条，不含 su 凭证。
+
+## 项目维护者
+
+<table>
+  <tr>
+    <td align="center"><img src="app/src/main/res/drawable-nodpi/maintainer_fish_neko.png" width="120" height="120" alt="Fish_Neko 的头像"><br><b>Fish_Neko</b></td>
+    <td align="center"><img src="app/src/main/res/drawable-nodpi/maintainer_gpt_sol.png" width="120" height="120" alt="GPT-6.1 Sol 的头像"><br><b>GPT-6.1 Sol</b></td>
+  </tr>
+</table>
 
 ## 参考与许可
 
