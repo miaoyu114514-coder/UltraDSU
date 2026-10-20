@@ -99,6 +99,8 @@ public class RootBridgeTest {
         set("imageRoot", temporary.newFolder("images"));
         set("directoryLabeler", (RootBridge.DirectoryLabeler) directory -> { });
         set("oneShotFile", new File(root, "one_shot_boot"));
+        set("growthRoot", temporary.newFolder("growth"));
+        set("backupDirectorySync", (RootBridge.BackupDirectorySync) directory -> { });
         set("imageWriter", (RootBridge.ImageWriter) (file, size) -> { });
         set("imageSizeReader", (RootBridge.ImageSizeReader) (service, name) -> ((Images) service).sizes.getOrDefault(name, 0L));
         add("alpha"); add("beta");
@@ -379,5 +381,58 @@ public class RootBridgeTest {
         gsi.images.get("beta").mapped = false;
         try { mutate("beta", specs("boot"), 0); fail(); } catch (IllegalArgumentException expected) { }
         assertTrue(gsi.changedPartitions.isEmpty());
+    }
+    private File prepareBackupManager() throws Exception {
+        Field field = RootBridge.class.getDeclaredField("imageRoot"); field.setAccessible(true); File imageRoot = (File)field.get(null);
+        for (String slot : Arrays.asList("alpha", "beta")) {
+            File directory = new File(imageRoot,slot); assertTrue(directory.mkdir());
+            Files.write(new File(directory,"userdata_gsi.img").toPath(),new byte[]{1});
+            Files.write(new File(directory,"userdata_gsi.img.0000").toPath(),new byte[]{7,8,9});
+            Files.write(new File(root,slot+"/install_dir").toPath(),directory.getAbsolutePath().getBytes());
+        }
+        field = RootBridge.class.getDeclaredField("growthRoot"); field.setAccessible(true);
+        File backup = new File((File)field.get(null),"alpha"); assertTrue(backup.mkdir());
+        Files.write(new File(backup,"userdata.raw").toPath(),new byte[4096]);
+        Files.write(new File(backup,"growth.json").toPath(),new org.json.JSONObject().put("version",1).put("phase","EXPANDED")
+            .put("oldBytes",4096).put("newBytes",8192).toString().getBytes());
+        return backup;
+    }
+    private org.json.JSONObject backups(String slot, String kind, String revision) throws Exception {
+        return (org.json.JSONObject)invoke("userdataBackups",new Class[]{String.class,String.class,String.class},slot,kind,revision);
+    }
+    @Test public void backupManagerProtectsAllBoundUserdataWithoutMappingOrNativeChecks() throws Exception {
+        prepareBackupManager();
+        set("platformSdk",34);
+        set("imageSizeReader",(RootBridge.ImageSizeReader)(service,name)->{throw new AssertionError("Manager must not map images");});
+        org.json.JSONArray entries=backups(null,null,null).getJSONArray("entries"); assertEquals(3,entries.length());
+        for(int i=0;i<2;i++) { assertEquals("current",entries.getJSONObject(i).getString("kind")); assertFalse(entries.getJSONObject(i).getBoolean("canDelete")); }
+        assertTrue(entries.getJSONObject(2).getBoolean("canDelete"));
+        assertTrue(gsi.changedPartitions.isEmpty()); assertEquals(0,gsi.globalRemoveCalls);
+    }
+    @Test public void backupDeletionNeverChangesLivePartitionsOrBootSelection() throws Exception {
+        File backup=prepareBackupManager(); org.json.JSONObject row=backups(null,null,null).getJSONArray("entries").getJSONObject(2);
+        gsi.enabled=true;
+        try { backups("alpha","current",row.getString("revision")); fail(); } catch(SecurityException expected){}
+        assertTrue(backup.isDirectory());
+        backups("alpha","growth",row.getString("revision")); assertFalse(backup.exists());
+        assertEquals("alpha",gsi.active); assertTrue(gsi.enabled); assertTrue(gsi.changedPartitions.isEmpty());
+        assertEquals(Arrays.asList("system_gsi","userdata_gsi"),gsi.images.get("alpha").names);
+        assertEquals(Arrays.asList("system_gsi","userdata_gsi"),gsi.images.get("beta").names);
+    }
+    @Test public void backupManagerRejectsLiveGuestInstallationAndUnverifiedLayouts() throws Exception {
+        File backup=prepareBackupManager(); String revision=backups(null,null,null).getJSONArray("entries").getJSONObject(2).getString("revision");
+        gsi.running=true; try { backups("alpha","growth",revision); fail(); } catch(IllegalStateException expected){}
+        gsi.running=false; gsi.installing=true; try { backups("alpha","growth",revision); fail(); } catch(IllegalStateException expected){}
+        gsi.installing=false; Files.write(new File(root,"beta/install_dir").toPath(),"/unknown/storage".getBytes());
+        assertFalse(backups(null,null,null).getJSONArray("entries").getJSONObject(2).getBoolean("canDelete"));
+        try { backups("alpha","growth",revision); fail(); } catch(IllegalStateException expected){}
+        assertTrue(new File(backup,"userdata.raw").isFile());
+    }
+    @Test public void repairMarkerKeepsBackupProtectedEvenWithCompletedGrowthJournal() throws Exception {
+        File backup=prepareBackupManager(); String revision=backups(null,null,null).getJSONArray("entries").getJSONObject(2).getString("revision");
+        Files.write(new File(root,"alpha/ultradsu_maintenance.json").toPath(),"[\"userdata\"]".getBytes());
+        assertFalse(backups(null,null,null).getJSONArray("entries").getJSONObject(2).getBoolean("canDelete"));
+        try { backups("alpha","growth",revision); fail(); } catch(IllegalStateException expected){}
+        assertTrue(new File(backup,"userdata.raw").isFile());
     }
 }

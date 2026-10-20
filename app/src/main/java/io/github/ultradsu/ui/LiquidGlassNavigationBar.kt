@@ -27,10 +27,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.layer.GraphicsLayer
@@ -64,7 +69,6 @@ import kotlin.math.roundToInt
     val surface = MaterialTheme.colorScheme.surfaceContainer
     val latestSelect by rememberUpdatedState(onSelect)
     val latestSelected by rememberUpdatedState(selected)
-    val tabsBackdrop = rememberGraphicsLayer()
     var barSize by remember { mutableStateOf(IntSize.Zero) }
     var barOrigin by remember { mutableStateOf(Offset.Zero) }
     var pressed by remember { mutableStateOf(false) }
@@ -89,6 +93,10 @@ import kotlin.math.roundToInt
     val displayedPosition = if (pressed) dragTarget ?: selected.toFloat() else position.value
     val physicalIndex = if (isLtr) displayedPosition else labels.lastIndex - displayedPosition
     val lensX = inset + cellWidth * physicalIndex
+    val lensHeight = with(density) { 56.dp.toPx() }
+    val velocity = position.velocity / 10f
+    val lensScaleX = scaleX / (1f - (velocity * .75f).coerceIn(-.2f, .2f))
+    val lensScaleY = scaleY * (1f - (velocity * .25f).coerceIn(-.2f, .2f))
     val tint = surface.copy(alpha = if (Build.VERSION.SDK_INT >= 31) .4f else .96f)
 
     fun activate(index: Int) { if (index != latestSelected) latestSelect(index) }
@@ -139,37 +147,44 @@ import kotlin.math.roundToInt
             GlassBackdrop(backdrop, barOrigin - backdropOrigin, tint, false, pressure, Modifier.matchParentSize())
             GlassRim(if (dark) .20f else .35f, Modifier.matchParentSize())
         }
-        GlassTabs(labels, icons, selected, foreground, 1f, Modifier.matchParentSize().selectableGroup(), ::activate)
-
-        // Capture a separate accent copy. The lens samples this copy; it never draws
-        // on screen and contributes no duplicate accessibility nodes.
-        Box(Modifier.matchParentSize().clearAndSetSemantics {}.drawWithContent {
-            tabsBackdrop.record { this@drawWithContent.drawContent() }
-        }) {
-            Box(Modifier.matchParentSize().clip(CircleShape)) {
-                GlassBackdrop(backdrop, barOrigin - backdropOrigin, tint, false, pressure, Modifier.matchParentSize())
-            }
-            GlassTabs(labels, icons, selected, primary, 1f + .2f * pressure, Modifier.matchParentSize(), null)
-        }
         if (cellWidth > 0) {
             Box(Modifier.offset(x = with(density) { lensX.toDp() }, y = 4.dp)
                 .width(with(density) { cellWidth.toDp() }).height(56.dp)
                 .graphicsLayer {
-                    val velocity = position.velocity / 10f
-                    this.scaleX = scaleX / (1f - (velocity * .75f).coerceIn(-.2f, .2f))
-                    this.scaleY = scaleY * (1f - (velocity * .25f).coerceIn(-.2f, .2f))
+                    this.scaleX = lensScaleX
+                    this.scaleY = lensScaleY
                 }.clip(CircleShape).clearAndSetSemantics {}) {
-                GlassBackdrop(tabsBackdrop, Offset(lensX, inset), Color.Transparent, true, pressure, Modifier.matchParentSize())
+                GlassBackdrop(backdrop, barOrigin - backdropOrigin + Offset(lensX, inset),
+                    tint, true, pressure, Modifier.matchParentSize())
                 Box(Modifier.matchParentSize().background(
                     (if (dark) Color.White else Color.Black).copy(alpha = .1f * (1f - pressure))))
                 GlassRim(.6f * pressure, Modifier.matchParentSize())
+            }
+        }
+        GlassTabs(labels, icons, selected, foreground, Modifier.matchParentSize().selectableGroup(), ::activate)
+
+        // Keep glyphs in bar coordinates, outside the scaled/refracted glass layer.
+        // Only the accent clip follows the lens, so pressing cannot magnify text or
+        // sample duplicate glyphs from a captured tab layer on different GPU drivers.
+        if (cellWidth > 0) {
+            Box(Modifier.matchParentSize().clearAndSetSemantics {}.drawWithContent {
+                val left = lensX + cellWidth * (1f - lensScaleX) / 2f
+                val top = inset + lensHeight * (1f - lensScaleY) / 2f
+                val bounds = Rect(left, top, left + cellWidth * lensScaleX, top + lensHeight * lensScaleY)
+                val outline = Path().apply {
+                    addRoundRect(RoundRect(bounds, CornerRadius(lensHeight * lensScaleX / 2f,
+                        lensHeight * lensScaleY / 2f)))
+                }
+                clipPath(outline) { this@drawWithContent.drawContent() }
+            }) {
+                GlassTabs(labels, icons, selected, primary, Modifier.matchParentSize(), null)
             }
         }
     }
 }
 
 @Composable private fun GlassTabs(
-    labels: List<String>, icons: List<ImageVector>, selected: Int, color: Color, scale: Float,
+    labels: List<String>, icons: List<ImageVector>, selected: Int, color: Color,
     modifier: Modifier, activate: ((Int) -> Unit)?,
 ) {
     Row(modifier.padding(4.dp)) {
@@ -184,8 +199,7 @@ import kotlin.math.roundToInt
                         true
                     } else false
                 }.focusable()
-            Column(Modifier.weight(1f).fillMaxHeight().then(interaction)
-                .graphicsLayer { scaleX = scale; scaleY = scale },
+            Column(Modifier.weight(1f).fillMaxHeight().then(interaction),
                 verticalArrangement = Arrangement.spacedBy(1.dp, Alignment.CenterVertically),
                 horizontalAlignment = Alignment.CenterHorizontally) {
                 Icon(icons[index], null, Modifier.size(24.dp), tint = color)
@@ -209,7 +223,7 @@ import kotlin.math.roundToInt
         }
         sample.renderEffect = when {
             Build.VERSION.SDK_INT >= 33 && lens != null -> lens.create(size, padding, density, pressure)
-            Build.VERSION.SDK_INT >= 31 && !indicator -> glassBlurEffect(density)
+            Build.VERSION.SDK_INT >= 31 -> glassBlurEffect(density)
             else -> null
         }
         translate(-padding, -padding) { drawLayer(sample) }

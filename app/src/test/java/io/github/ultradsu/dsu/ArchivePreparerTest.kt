@@ -30,6 +30,31 @@ class ArchivePreparerTest {
         val result = prepare(zip("nested/PixelOS.img" to raw()))
         assertEquals("system", result.single().partition); assertEquals(8192L, result.single().bytes)
     }
+    @Test fun `archive progress follows each raw entry and the complete installer package`() {
+        val file = zip("system.img" to raw(), "product.img" to raw(true))
+        val events = mutableListOf<OperationProgress>()
+        val preparer = ArchivePreparer(onProgress = events::add)
+        val output = temp.newFolder()
+        val images = preparer.prepare(file, file.name, output)
+        for (name in listOf("system.img", "product.img")) {
+            val completed = events.first { it.message == "已解包 $name" }
+            assertEquals(8192L, completed.totalBytes)
+            assertEquals(8192L, completed.bytes)
+        }
+        preparer.installerZip(images, output)
+        assertEquals(16384L, events.last().bytes)
+        assertEquals(16384L, events.last().totalBytes)
+    }
+    @Test fun `compressed entries never use compressed sizes as expanded image totals`() {
+        val compressed = java.io.ByteArrayOutputStream().also { out -> GZIPOutputStream(out).use { it.write(raw()) } }.toByteArray()
+        for (name in listOf("system.img.gz", "system.img")) {
+            val file = zip(name to compressed)
+            val events = mutableListOf<OperationProgress>()
+            ArchivePreparer(onProgress = events::add).prepare(file, file.name, temp.newFolder())
+            assertEquals(8192L, events.last().bytes)
+            assertNull(events.last().fraction)
+        }
+    }
     @Test fun `prepared gzip uses stored blocks and preserves exact filesystem bytes`() {
         val source = temp.newFile("system.img").apply { writeBytes(raw(true)) }
         val output = temp.newFolder()

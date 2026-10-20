@@ -1,0 +1,7 @@
+Offline userdata maintenance
+AOSP vold / libdm and Keystore2 / KeyMint NDK clients
+Copyright The Android Open Source Project
+Licensed under the Apache License, Version 2.0.
+UltraDSU modifications: read-only key retrieval, private namespace maintenance, durable recovery and ciphertext-aware F2FS migration.
+The separate modified f2fs-tools executable is GPL-2.0; complete upstream source, notices and build modifications are provided in native/userdata-grow/ in the project repository.
+Source: https://github.com/miaoyu114514-coder/UltraDSU

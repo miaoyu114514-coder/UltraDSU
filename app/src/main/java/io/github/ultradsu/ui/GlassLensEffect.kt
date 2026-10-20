@@ -28,7 +28,9 @@ internal class GlassLensEffect(private val indicator: Boolean) {
     private val shader = RuntimeShader(if (indicator) ROUNDED_RECT_REFRACTION_WITH_DISPERSION_SHADER else ROUNDED_RECT_REFRACTION_SHADER)
 
     fun create(size: Size, padding: Float, density: Float, pressure: Float): androidx.compose.ui.graphics.RenderEffect? {
-        if (indicator && pressure < .001f) return null
+        // The indicator samples the page directly; keep it blurred even at rest.
+        // Foreground tab glyphs are drawn separately and never enter this chain.
+        if (indicator && pressure < .001f) return glassBlurEffect(density)
         val radius = size.height / 2f
         shader.setFloatUniform("size", size.width, size.height)
         shader.setFloatUniform("offset", -padding, -padding)
@@ -38,7 +40,7 @@ internal class GlassLensEffect(private val indicator: Boolean) {
         shader.setFloatUniform("depthEffect", if (indicator) 1f else 0f)
         if (indicator) shader.setFloatUniform("chromaticAberration", .5f)
         val lens = RenderEffect.createRuntimeShaderEffect(shader, "content")
-        return (if (indicator) lens else RenderEffect.createChainEffect(lens, nativeGlassBlur(density))).asComposeRenderEffect()
+        return RenderEffect.createChainEffect(lens, nativeGlassBlur(density)).asComposeRenderEffect()
     }
 }
 

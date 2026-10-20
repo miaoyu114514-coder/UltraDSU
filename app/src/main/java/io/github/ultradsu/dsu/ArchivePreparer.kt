@@ -13,9 +13,13 @@ import java.util.zip.*
 /** Pure JVM archive preparation. Entry names are never used as filesystem output paths. */
 class ArchivePreparer(private val progress: (String) -> Unit = {}, private val checkpoint: () -> Unit = {},
     private val maxBytes: Long = 128 * GIB, private val compressionLevel: Int = Deflater.NO_COMPRESSION,
-    private val sevenZip: SevenZipReader? = null) {
+    private val sevenZip: SevenZipReader? = null,
+    private val onProgress: (OperationProgress) -> Unit = {}) {
     fun interface SevenZipReader {
-        fun read(source: File, consumer: (String, Boolean, InputStream) -> Unit)
+        fun read(source: File, consumer: (String, Boolean, Long, InputStream) -> Unit)
+    }
+    private fun report(message: String, bytes: Long = 0, expected: Long = 0) {
+        progress(message); onProgress(OperationProgress(message, bytes, expected.coerceAtLeast(0)))
     }
     private var total = 0L
     private var entries = 0
@@ -42,11 +46,21 @@ class ArchivePreparer(private val progress: (String) -> Unit = {}, private val c
         }
         return stream.buffered(1024 * 1024)
     }
-    private fun consume(name: String, input: InputStream, output: File) {
+    private fun compressed(signature: ByteArray): Boolean =
+        (signature.size >= 2 && signature[0] == 0x1f.toByte() && signature[1] == 0x8b.toByte()) ||
+            signature.contentEquals(byteArrayOf(0xfd.toByte(), 0x37, 0x7a, 0x58, 0x5a, 0)) ||
+            (signature.size >= 3 && String(signature, 0, 3, Charsets.US_ASCII) == "BZh")
+    private fun consume(name: String, input: InputStream, output: File, declaredBytes: Long = 0) {
         require(results.size < 32) { "镜像数量超过 32" }
+        // Nested compressed images declare compressed entry sizes, not decoded sizes.
+        val encoded = input.buffered(1024 * 1024)
+        encoded.mark(6); val signature = header(encoded, 6); encoded.reset()
+        val expected = if (name.lowercase().endsWith(".img") && !compressed(signature)) declaredBytes.coerceAtLeast(0) else 0
+        report("解包 $name", 0, expected)
+        lastReport = 0
         val file = File(output, "${UUID.randomUUID()}.img.gz")
         var size = 0L
-        decoded(input).use { image ->
+        decoded(encoded).use { image ->
             image.mark(4096)
             val header = ByteArray(4096); var read = 0
             while (read < header.size) { val n = image.read(header, read, header.size - read); if (n < 0) break; read += n }
@@ -69,12 +83,14 @@ class ArchivePreparer(private val progress: (String) -> Unit = {}, private val c
                     if (System.currentTimeMillis() - lastReport > 1000) {
                         check(output.usableSpace > 256 * 1024 * 1024) { "存储空间不足" }
                         val seconds = (System.nanoTime() - started) / 1_000_000_000.0
-                        progress("解包 $name · ${size / (1024 * 1024)} MiB · ${"%.1f".format(java.util.Locale.ROOT, size / 1048576.0 / seconds)} MiB/s"); lastReport = System.currentTimeMillis()
+                        report("解包 $name · ${"%.1f".format(java.util.Locale.ROOT, size / 1048576.0 / seconds)} MiB/s", size, expected)
+                        lastReport = System.currentTimeMillis()
                     }
                 }
             }
         }
         require(size % 4096 == 0L) { "$name：镜像大小未按 4096 字节对齐" }
+        report("已解包 $name", size, expected)
         results += PartitionImage("", file.name, size, name)
     }
     private fun borrowed(input: InputStream) = object : FilterInputStream(input) { override fun close() {} }
@@ -97,7 +113,7 @@ class ArchivePreparer(private val progress: (String) -> Unit = {}, private val c
                             require(zip.canReadEntryData(e)) { "不支持或已加密的 ZIP 条目：${e.name}" }
                             zip.getInputStream(e).use { raw ->
                                 val crc = CRC32(); val checked = CheckedInputStream(raw, crc)
-                                consume(e.name, borrowed(checked), output)
+                                consume(e.name, borrowed(checked), output, e.size)
                                 if (e.crc >= 0) require(crc.value == e.crc) { "ZIP 校验失败：${e.name}" }
                             }
                         }
@@ -105,9 +121,9 @@ class ArchivePreparer(private val progress: (String) -> Unit = {}, private val c
                 }
             }
             signature.contentEquals(byteArrayOf(0x37, 0x7a, 0xbc.toByte(), 0xaf.toByte(), 0x27, 0x1c)) -> {
-                if (sevenZip != null) sevenZip.read(source) { name, directory, stream ->
+                if (sevenZip != null) sevenZip.read(source) { name, directory, declaredBytes, stream ->
                     entry(name)
-                    if (!directory && imageName(name)) consume(name, borrowed(stream), output)
+                    if (!directory && imageName(name)) consume(name, borrowed(stream), output, declaredBytes)
                     else if (!directory) {
                         val buffer = ByteArray(65536)
                         while (true) { checkpoint(); val n = stream.read(buffer); if (n < 0) break; budget(n.toLong()) }
@@ -121,7 +137,7 @@ class ArchivePreparer(private val progress: (String) -> Unit = {}, private val c
                                 override fun read() = seven.read()
                                 override fun read(b: ByteArray, off: Int, len: Int) = seven.read(b, off, len)
                             }
-                            consume(name, stream, output)
+                            consume(name, stream, output, e.size)
                         } else if (!e.isDirectory) {
                             val buffer = ByteArray(65536)
                             while (true) { val n = seven.read(buffer); if (n < 0) break; budget(n.toLong()) }
@@ -137,32 +153,42 @@ class ArchivePreparer(private val progress: (String) -> Unit = {}, private val c
                     while (true) {
                         val e = archive.nextEntry ?: break; entry(e.name)
                         require(!e.isSymbolicLink && !e.isLink) { "TAR 中不允许链接" }
-                        if (e.isFile && imageName(e.name)) consume(e.name, borrowed(archive), output)
+                        if (e.isFile && imageName(e.name)) consume(e.name, borrowed(archive), output, e.size)
                         else {
                             val buffer = ByteArray(65536)
                             while (true) { val n = archive.read(buffer); if (n < 0) break; budget(n.toLong()) }
                         }
                     }
-                } else consume(sourceName, borrowed(stream), output)
+                } else consume(sourceName, borrowed(stream), output, if (compressed(signature)) 0 else source.length())
             }
         }
         return PartitionRules.assign(results, singleTarget, requireSystem)
     }
     fun installerZip(images: List<PartitionImage>, directory: File): File {
         val target = File(directory, "package.zip")
+        val expected = images.sumOf { it.bytes }
+        var written = 0L
+        var reported = 0L
         ZipOutputStream(target.outputStream().buffered(1024 * 1024)).use { zip ->
             zip.setLevel(Deflater.NO_COMPRESSION)
             for (image in images) {
-                checkpoint(); progress("打包系统安装器分区：${image.partition}")
+                checkpoint(); report("打包安装器分区：${image.partition}", written, expected)
                 zip.putNextEntry(ZipEntry("${image.partition}.img"))
                 GZIPInputStream(File(directory, image.fileName).inputStream()).use { input ->
                     val buffer = ByteArray(1024 * 1024)
                     while (true) { checkpoint(); val n = input.read(buffer); if (n < 0) break
-                        check(directory.usableSpace > 256 * 1024 * 1024) { "存储空间不足" }; zip.write(buffer, 0, n) }
+                        check(directory.usableSpace > 256 * 1024 * 1024) { "存储空间不足" }; zip.write(buffer, 0, n)
+                        written += n
+                        if (System.currentTimeMillis() - reported >= 250) {
+                            report("打包安装器分区：${image.partition}", written, expected)
+                            reported = System.currentTimeMillis()
+                        }
+                    }
                 }
                 zip.closeEntry()
             }
         }
+        report("安装器包已生成", written, expected)
         return target
     }
 }

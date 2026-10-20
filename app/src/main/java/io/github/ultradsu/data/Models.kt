@@ -64,6 +64,26 @@ data class DeviceStatus(
     val detail: String = "",
 )
 
+data class UserdataGrowthInfo(
+    val supported: Boolean = false, val reason: String = "", val filesystem: String = "",
+    val encrypted: Boolean = false, val actualBytes: Long = 0, val filesystemBytes: Long = 0,
+    val exists: Boolean = false, val phase: String = "", val backupBytes: Long = 0,
+    val oldBytes: Long = 0, val newBytes: Long = 0, val canRollback: Boolean = false, val canDiscard: Boolean = false,
+    val checkFailed: Boolean = false,
+    val canAssist: Boolean = false, val assistancePhase: String = "NONE", val assisted: Boolean = false,
+)
+
+data class GuestAssistanceInfo(val slot: String, val phase: String)
+
+data class UserdataBackupEntry(
+    val slot: String, val kind: String, val bytes: Long = 0, val modified: Long = 0,
+    val canDelete: Boolean = false, val reason: String = "", val phase: String = "",
+    val revision: String = "",
+) {
+    val id get() = "$slot:$kind"
+    val current get() = kind == "current"
+}
+
 object SlotRules {
     // Used for filesystem identifiers and shell arguments. User-facing labels are independent.
     fun validName(value: String) = value.matches(Regex("[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}"))

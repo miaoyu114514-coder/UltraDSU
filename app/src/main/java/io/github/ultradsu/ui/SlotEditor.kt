@@ -20,12 +20,12 @@ import androidx.compose.ui.unit.dp
 import io.github.ultradsu.AppState
 import io.github.ultradsu.AppViewModel
 import io.github.ultradsu.data.*
-import io.github.ultradsu.dsu.PreparationState
 
 /** A full secondary page. Basic settings remain available without Root. */
 @Composable internal fun SlotEditorScreen(
-    model: AppViewModel, state: AppState, slot: DsuSlot, locked: Boolean, preparation: PreparationState,
-    onBack: () -> Unit, backEnabled: Boolean, readReady: Boolean, confirm: (String, String, () -> Unit) -> Unit,
+    model: AppViewModel, state: AppState, slot: DsuSlot, locked: Boolean,
+    onBack: () -> Unit, backEnabled: Boolean, onManageBackups: () -> Unit,
+    readReady: Boolean, confirm: (String, String, () -> Unit) -> Unit,
 ) {
     var label by rememberSaveable(slot.id) { mutableStateOf(slot.displayName) }
     var size by rememberSaveable(slot.id) { mutableStateOf(slot.userdataGiB.toString()) }
@@ -64,10 +64,6 @@ import io.github.ultradsu.dsu.PreparationState
             Column(Modifier.widthIn(max = 720.dp).fillMaxSize().verticalScroll(rememberScrollState())
                 .navigationBarsPadding().padding(horizontal = 22.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                if (locked) UCard {
-                    UText(if (preparation.busy) preparation.message else "正在读取分区…", 14, color = accent)
-                    if (preparation.busy && !preparation.installation) UButton("取消准备", onClick = model::cancelPreparation)
-                }
                 state.message?.let { message -> UCard {
                     UText(message, 13, color = mutedColor)
                     UButton("知道了", onClick = model::dismissMessage)
@@ -133,6 +129,12 @@ import io.github.ultradsu.dsu.PreparationState
                             }
                         }
                     }
+                    UCard {
+                        UText("userdata 备份管理", 18, true)
+                        UText("在用 userdata 始终保留；可单独清理已完成扩容后留下的备份。", 13, color = mutedColor)
+                        UButton("管理 userdata 备份", !locked, modifier = Modifier.fillMaxWidth(), onClick = onManageBackups)
+                    }
+                    UserdataGrowthCard(model, state, slot, !locked && !state.device.running, confirm, onManageBackups)
                     UCard {
                         UText("重建 userdata 扩容", 18, true)
                         UText("此操作清除 ${slot.slotName} 槽的全部应用、账号、文件和设置。system 等镜像保留。这是重建，不是无损扩容。", 13, color = Color(0xFFC13D42))

@@ -1,0 +1,6 @@
+// Opt-in instrumentation against the signed release app; no production manifest changes.
+gradle.beforeProject { project ->
+    project.plugins.withId('com.android.application') {
+        project.android.testBuildType = 'release'
+    }
+}

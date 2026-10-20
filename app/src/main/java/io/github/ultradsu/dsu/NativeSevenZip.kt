@@ -8,7 +8,7 @@ import java.nio.ByteBuffer
 
 /** Native liblzma decoding. The shared preparer still validates paths, bytes and images. */
 object NativeSevenZip : ArchivePreparer.SevenZipReader {
-    override fun read(source: File, consumer: (String, Boolean, InputStream) -> Unit) {
+    override fun read(source: File, consumer: (String, Boolean, Long, InputStream) -> Unit) {
         val archive = Archive.readNew()
         try {
             Archive.readSupportFilterNone(archive)
@@ -39,7 +39,8 @@ object NativeSevenZip : ArchivePreparer.SevenZipReader {
                         return count
                     }
                 }
-                consumer(name, type == ArchiveEntry.AE_IFDIR, stream)
+                consumer(name, type == ArchiveEntry.AE_IFDIR,
+                    if (ArchiveEntry.sizeIsSet(entry)) ArchiveEntry.size(entry) else 0, stream)
             }
         } finally { Archive.readFree(archive) }
     }

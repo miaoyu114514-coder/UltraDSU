@@ -12,7 +12,11 @@ import androidx.lifecycle.viewModelScope
 import io.github.ultradsu.data.*
 import io.github.ultradsu.dsu.PreparationService
 import io.github.ultradsu.dsu.RootClient
+import io.github.ultradsu.dsu.UserdataGrowthCheck
+import io.github.ultradsu.dsu.GuestAssistanceClient
+import io.github.ultradsu.diagnostics.DebugLog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -24,14 +28,24 @@ import java.util.Locale
 data class AppState(
     val style: UiStyle = UiStyle.MIUIX,
     val glassNavigation: Boolean = false,
+    val debugMode: Boolean = false,
+    val diagnosticsBusy: Boolean = false,
     val slots: List<DsuSlot> = emptyList(),
     val device: DeviceStatus,
     val root: Boolean = false,
     val rootRequested: Boolean = false,
     val busy: Boolean = false,
+    val operationLabel: String = "",
     val message: String? = null,
     val log: List<String> = emptyList(),
     val inventories: Map<String, PartitionInventory> = emptyMap(),
+    val growthInfo: Map<String, UserdataGrowthInfo> = emptyMap(),
+    val growthCheckingSlotId: String? = null,
+    val guestAssistance: GuestAssistanceInfo? = null,
+    val userdataBackups: List<UserdataBackupEntry> = emptyList(),
+    val userdataBackupsLoaded: Boolean = false,
+    val userdataBackupsError: String? = null,
+    val userdataBackupsMessage: String? = null,
 )
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
@@ -45,6 +59,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val mutableState = MutableStateFlow(AppState(
         style = runCatching { UiStyle.valueOf(preferences.getString("style", "MIUIX")!!) }.getOrDefault(UiStyle.MIUIX),
         glassNavigation = preferences.getBoolean("glass_navigation", false),
+        debugMode = preferences.getBoolean("debug_enabled", false),
         device = initialDevice, rootRequested = preferences.getBoolean("root_enabled", false),
         root = root.authorized && preferences.getBoolean("root_enabled", false)))
     val state = mutableState.asStateFlow()
@@ -56,19 +71,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             preparation.collect { prep ->
                 if (!prep.busy && prep.finishedAt > 0) {
-                    reload(); notify(prep.message)
-                    if (prep.installation && state.value.root) refresh()
+                    reload(); notify(prep.message, showMessage = false)
+                    if (prep.installation && state.value.root) {
+                        if (prep.title in setOf("保留数据扩容", "回退 userdata")) operation("刷新扩容结果") {
+                            syncDevice()
+                            state.value.slots.find { it.id == prep.id }?.let { loadImagesInternal(it); loadGrowthInternal(it) }
+                        } else refresh()
+                    }
                 }
             }
         }
     }
     fun dismissMessage() { mutableState.update { it.copy(message = null) } }
-    fun notify(message: String) {
+    fun dismissTaskResult() { PreparationService.dismissResult() }
+    fun notify(message: String, showMessage: Boolean = true) {
+        DebugLog.event("app", message)
         val time = SimpleDateFormat("HH:mm:ss", Locale.ROOT).format(Date())
-        mutableState.update { it.copy(message = message, log = (listOf("$time  $message") + it.log).take(100)) }
+        mutableState.update { it.copy(message = if (showMessage) message else null,
+            log = (listOf("$time  $message") + it.log).take(100)) }
     }
     private fun reload() {
-        runCatching { store.read() }.onSuccess { list -> mutableState.update { it.copy(slots = list) } }
+        runCatching { store.read() }.onSuccess { list -> DebugLog.rememberSlots(list); mutableState.update { it.copy(slots = list) } }
             .onFailure { notify("槽位记录读取失败，已保留原文件：${it.message}") }
     }
     fun style(style: UiStyle) {
@@ -79,12 +102,50 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         preferences.edit().putBoolean("glass_navigation", enabled).apply()
         mutableState.update { it.copy(glassNavigation = enabled) }
     }
-    private fun operation(block: suspend () -> Unit) {
-        if (state.value.busy || preparation.value.busy) return
-        mutableState.update { it.copy(busy = true) }
+    fun debugMode(enabled: Boolean) {
+        DebugLog.setEnabled(context, enabled)
+        mutableState.update { it.copy(debugMode = enabled) }
+    }
+    fun exportDebugLog(uri: Uri) = diagnostics {
+        val report = DebugLog.snapshot()
+        withContext(Dispatchers.IO) {
+            val stream = context.contentResolver.openOutputStream(uri, "wt") ?: error("无法打开导出文件")
+            stream.bufferedWriter(Charsets.UTF_8).use { it.write(report) }
+        }
+        notify("调试日志已导出，请检查内容后再分享")
+    }
+    fun clearDebugLog() = diagnostics { DebugLog.clear(); notify("调试日志已清空", showMessage = true) }
+    fun collectDsuDiagnostics() = diagnostics {
+        check(state.value.debugMode && state.value.root) { "请先开启调试模式并授权 Root" }
+        DebugLog.rememberSlots(store.read())
+        // Fixed allowlist. Never dump getprop, keys, manifests, dm tables or the entire logcat.
+        val properties = listOf("ro.crypto.state", "ro.crypto.type", "ro.crypto.metadata.enabled",
+            "ro.crypto.dm_default_key.options_format.version", "ro.gsid.image_running")
+        for (property in properties) DebugLog.event("system-property", "$property=${root.shell("getprop $property").trim()}")
+        val logs = root.shell("logcat -b all -d -t 200 -v brief -s gsid:V vold:V fs_mgr:V '*:S'")
+        DebugLog.event("system-log", logs.ifBlank { "No matching retained system logs; reproduce first. Guest boot failures may need guest/recovery logs." })
+        notify("已采集 DSU 系统诊断，可导出日志")
+    }
+    private fun diagnostics(block: suspend () -> Unit) {
+        if (state.value.diagnosticsBusy) return
+        mutableState.update { it.copy(diagnosticsBusy = true) }
         viewModelScope.launch {
-            try { block() } catch (e: Exception) { notify(e.message ?: "操作失败") }
-            finally { mutableState.update { it.copy(busy = false) } }
+            try { block() }
+            catch (e: Exception) { DebugLog.event("diagnostics", "failed", e); notify(e.message ?: "日志操作失败") }
+            finally { mutableState.update { it.copy(diagnosticsBusy = false) } }
+        }
+    }
+    private fun operation(label: String, showFailureMessage: Boolean = true, block: suspend () -> Unit) {
+        if (state.value.busy || preparation.value.busy) return
+        mutableState.update { it.copy(busy = true, operationLabel = label) }
+        DebugLog.event("operation", "start $label")
+        viewModelScope.launch {
+            try { block(); DebugLog.event("operation", "success $label") }
+            catch (e: Exception) {
+                DebugLog.event("operation", "failed $label", e)
+                if (showFailureMessage) notify(e.message ?: "操作失败")
+            }
+            finally { mutableState.update { it.copy(busy = false, operationLabel = "") } }
         }
     }
     fun rootEnabled(enabled: Boolean) {
@@ -94,16 +155,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (!enabled) {
             if (state.value.busy) return
             root.revoke()
-            mutableState.update { it.copy(root = false, rootRequested = false, device = initialDevice) }
+            mutableState.update { it.copy(root = false, rootRequested = false, device = initialDevice,
+                userdataBackups = emptyList(), userdataBackupsLoaded = false, userdataBackupsError = null, userdataBackupsMessage = null) }
             return
         }
-        operation {
+        operation("检查 Root 授权") {
             check(root.authorize()) { "Root 授权失败或被拒绝，Root 功能保持隐藏" }
             mutableState.update { it.copy(root = true) }
             syncDevice()
         }
     }
-    fun refresh() { reload(); if (state.value.root) operation { syncDevice() } }
+    fun refresh() { reload(); if (state.value.root) operation("刷新系统槽") { syncDevice() } }
     private suspend fun syncDevice(): DeviceStatus {
         val json = root.bridge("status")
         val array = json.getJSONArray("slots")
@@ -133,7 +195,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             store.write(merged); merged
         }
-        mutableState.update { it.copy(device = device, slots = local) }
+        DebugLog.rememberSlots(local)
+        DebugLog.event("device", "multiSlot=${device.multiSlot} internalMultiSlot=${device.internalMultiSlot} running=${device.running} installing=${device.installing} slots=${local.size}")
+        json.optJSONObject("userdataSizeErrors")?.takeIf { it.length() > 0 }?.let {
+            DebugLog.event("userdata-size", it.toString())
+        }
+        val assistance = json.optJSONObject("guestAssistance")?.takeIf { it.optString("phase") != "NONE" }
+            ?.let { GuestAssistanceInfo(it.getString("slot"), it.getString("phase")) }
+        mutableState.update { it.copy(device = device, slots = local, guestAssistance = assistance) }
         return device
     }
     fun sourceName(uri: Uri): String {
@@ -199,7 +268,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             notify("已标记为提交；安装结果请查看系统 DSU 通知，或开启 Root 后刷新核实")
         }.onFailure { notify("请求已发出但本地状态保存失败：${it.message}") }
     }
-    fun install(slot: DsuSlot) = operation {
+    fun install(slot: DsuSlot) = operation("检查安装条件") {
         val device = syncDevice()
         check(!device.running && !device.installing) { "请先返回主系统并等待当前 DSU 安装结束" }
         check(slot.slotName !in device.occupiedSlots) { "系统已有同名槽位或未完成的安装，已阻止覆盖" }
@@ -221,17 +290,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         submitted(slot)
     }
-    fun enable(slot: DsuSlot, sticky: Boolean, reboot: Boolean) = operation {
+    fun enable(slot: DsuSlot, sticky: Boolean, reboot: Boolean) = operation("设置启动槽") {
         root.bridge("enable", slot.slotName, if (sticky) "sticky" else "once")
         syncDevice()
         notify("已选择 ${slot.slotName}，${if (sticky) "持续启动" else "仅启动一次"}")
         if (reboot) root.shell("svc power reboot")
     }
-    fun returnToHost(reboot: Boolean) = operation {
+    fun returnToHost(reboot: Boolean) = operation("停用 DSU") {
         root.bridge("disable"); syncDevice(); notify("已停用 DSU，下次启动进入主系统")
         if (reboot) root.shell("svc power reboot")
     }
-    fun delete(slot: DsuSlot) = operation {
+    fun delete(slot: DsuSlot) = operation("删除 ${slot.slotName}") {
         if (slot.state in listOf(SlotState.INSTALLED, SlotState.SUBMITTED, SlotState.INCOMPLETE, SlotState.MISSING)) {
             val device = syncDevice()
             if (slot.slotName in device.occupiedSlots) root.bridge("remove", slot.slotName)
@@ -248,7 +317,51 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         reload(); notify("已删除 ${slot.displayName}")
     }
-    fun loadImages(slot: DsuSlot) = operation {
+    fun loadImages(slot: DsuSlot) = operation("读取 ${slot.slotName} 的分区") {
+        loadImagesInternal(slot)
+    }
+    private fun updateUserdataBackups(result: JSONObject) {
+        val entries = result.getJSONArray("entries")
+        val rows = (0 until entries.length()).map { index ->
+            val item = entries.getJSONObject(index)
+            UserdataBackupEntry(item.getString("slot"), item.getString("kind"), item.optLong("bytes"),
+                item.optLong("modified"), item.optBoolean("canDelete"), item.optString("reason"),
+                item.optString("phase"), item.optString("revision"))
+        }
+        mutableState.update { it.copy(userdataBackups = rows, userdataBackupsLoaded = true, userdataBackupsError = null, userdataBackupsMessage = null) }
+    }
+    fun loadUserdataBackups() = operation("读取 userdata 备份", showFailureMessage = false) {
+        try {
+            check(state.value.root) { "请先开启并授权 Root" }
+            updateUserdataBackups(root.bridge("userdata-backups"))
+        } catch (failure: Exception) {
+            mutableState.update { it.copy(userdataBackupsError = failure.message ?: "无法读取备份，请重试") }
+            throw failure
+        }
+    }
+    fun deleteUserdataBackup(entry: UserdataBackupEntry) = operation("删除 userdata 备份", showFailureMessage = false) {
+        try {
+            check(state.value.root && !entry.current && entry.kind == "growth" && entry.canDelete) { "此 userdata 受保护，不可删除" }
+            val result = root.bridge("userdata-backup-delete", entry.slot, entry.kind, entry.revision)
+            updateUserdataBackups(result)
+            // Drop stale compatibility results immediately; they must not offer rollback
+            // after the actual backup has been removed through the manager.
+            val ids = state.value.slots.filter { it.slotName == entry.slot }.map { it.id }.toSet()
+            mutableState.update { it.copy(growthInfo = it.growthInfo.filterKeys { id -> id !in ids }) }
+            val cleanup = if (Build.VERSION.SDK_INT >= 36 && state.value.device.internalMultiSlot &&
+                entry.slot in state.value.device.occupiedSlots) runCatching { GuestAssistanceClient(root).clear(entry.slot) }.exceptionOrNull() else null
+            if (cleanup != null) DebugLog.event("userdata-backup", "credential cleanup unavailable", cleanup)
+            val message = if (cleanup == null) "${entry.slot} 的备份已删除，当前 userdata 保留" else
+                "备份已删除，当前 userdata 保留；协作准备未能清理，可在槽编辑页重试"
+            mutableState.update { it.copy(userdataBackupsMessage = message) }
+            notify(message, showMessage = false)
+        } catch (failure: Exception) {
+            // A stale list must never keep a destructive action enabled after rejection.
+            mutableState.update { it.copy(userdataBackupsError = failure.message ?: "删除失败，请刷新后重试") }
+            throw failure
+        }
+    }
+    private suspend fun loadImagesInternal(slot: DsuSlot) {
         check(state.value.root && state.value.device.multiSlot) { "槽内分区管理需要 Root 和 Android 11+" }
         val json = root.bridge("images", slot.slotName)
         val list = json.getJSONArray("partitions")
@@ -260,6 +373,70 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val bytes = partitions.find { it.name == "userdata" }?.bytes ?: 0
         if (bytes >= GIB && bytes / GIB <= 512) { store.update(slot.id) { it.copy(userdataGiB = (bytes / GIB).toInt()) }; reload() }
     }
+    fun loadGrowth(slot: DsuSlot) = operation("检查保留数据扩容", showFailureMessage = false) {
+        loadGrowthInternal(slot)
+    }
+    private suspend fun loadGrowthInternal(slot: DsuSlot) {
+        mutableState.update { it.copy(growthCheckingSlotId = slot.id) }
+        try {
+            check(state.value.root && !state.value.device.running) { "请先返回主系统并授权 Root" }
+            val result = GuestAssistanceClient(root).bridge("grow-info", slot.slotName)
+            result.optString("reason").takeIf { it.isNotBlank() }?.let { DebugLog.event("grow-probe", it) }
+            val info = UserdataGrowthCheck.read(result, Build.VERSION.SDK_INT)
+            mutableState.update { it.copy(growthInfo = it.growthInfo + (slot.id to info)) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            mutableState.update { it.copy(growthInfo = it.growthInfo + (slot.id to
+                UserdataGrowthCheck.failed(it.growthInfo[slot.id], failure.message.orEmpty(), Build.VERSION.SDK_INT))) }
+            throw failure
+        } finally {
+            mutableState.update { it.copy(growthCheckingSlotId = null) }
+        }
+    }
+    fun growUserdata(slot: DsuSlot, size: String) = operation("检查扩容条件") {
+        val value = size.toIntOrNull()
+        check(value != null && value in 1..512 && value > slot.userdataGiB) { "新容量必须大于现有容量，且在 1–512 GiB 之间" }
+        val device = syncDevice()
+        check(state.value.root && device.multiSlot && !device.running && !device.installing) { "当前状态不允许扩容" }
+        check(state.value.growthInfo[slot.id]?.supported == true) { "请先检查本机兼容性" }
+        context.startForegroundService(Intent(context, PreparationService::class.java).setAction("grow")
+            .putExtra("slotId", slot.id).putExtra("userdataGiB", value))
+    }
+    fun rollbackGrowth(slot: DsuSlot) = operation("检查扩容回退条件") {
+        val device = syncDevice()
+        check(state.value.root && !device.running) { "请先返回主系统" }
+        context.startForegroundService(Intent(context, PreparationService::class.java).setAction("grow-rollback").putExtra("slotId", slot.id))
+    }
+    fun discardGrowth(slot: DsuSlot) = operation("清理扩容备份") {
+        check(state.value.root && !state.value.device.running) { "请先返回主系统并授权 Root" }
+        root.bridge("grow-discard", slot.slotName)
+        GuestAssistanceClient(root).clear(slot.slotName)
+        loadGrowthInternal(slot)
+        notify("扩容备份已清理")
+    }
+    fun prepareGuestAssistance(slot: DsuSlot) = operation("准备客体协作") {
+        check(state.value.root && !state.value.device.running) { "请先返回主系统并授权 Root" }
+        GuestAssistanceClient(root).prepare(slot.slotName)
+        loadGrowthInternal(slot)
+    }
+    fun clearGuestAssistance(slot: DsuSlot) = operation("清理客体协作准备") {
+        GuestAssistanceClient(root).clear(slot.slotName)
+        loadGrowthInternal(slot)
+    }
+    fun bootForGuestAssistance(slot: DsuSlot) = operation("启动客体进行协作") {
+        root.bridge("assist-boot", slot.slotName)
+        root.shell("reboot")
+    }
+    fun captureGuestAssistance() = operation("加密采集客体协作信息") {
+        root.bridge("assist-capture")
+        syncDevice()
+        notify("客体协作信息已加密保存，请返回主系统，在本槽检查兼容性后扩容")
+    }
+    fun returnFromGuestAssistance() = operation("返回主系统") {
+        root.bridge("assist-return")
+        root.shell("reboot")
+    }
     fun stageImages(slot: DsuSlot, uri: Uri, name: String, partition: String) {
         if (state.value.busy || preparation.value.busy) return
         runCatching {
@@ -269,7 +446,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 .putExtra("slotId", slot.id).putExtra("sourceUri", uri.toString()).putExtra("sourceName", name).putExtra("partition", partition))
         }.onFailure { notify(it.message ?: "无法准备替换镜像") }
     }
-    fun applyImages(slot: DsuSlot) = operation {
+    fun applyImages(slot: DsuSlot) = operation("检查分区替换条件") {
         val device = syncDevice()
         check(state.value.root && device.multiSlot && !device.running && !device.installing) { "当前状态不允许替换分区" }
         check(slot.pendingImages.isNotEmpty()) { "请先导入替换镜像" }
@@ -282,7 +459,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             notify("新容量必须大于当前 userdata 容量，且在 1–512 GiB 之间"); return false
         }
         if (!state.value.root || !state.value.device.multiSlot || state.value.busy || preparation.value.busy) return false
-        operation {
+        operation("检查 userdata 重建条件") {
             val device = syncDevice()
             check(!device.running && !device.installing) { "请先返回主系统，并等待当前安装结束" }
             context.startForegroundService(Intent(context, PreparationService::class.java).setAction("resize")

@@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -46,10 +47,13 @@ val accent: Color @Composable get() = if (mi) MiuixTheme.colorScheme.primary els
 }
 
 @Composable fun UText(value: String, size: Int = 15, bold: Boolean = false,
-    color: Color = inkColor, modifier: Modifier = Modifier) {
+    color: Color = inkColor, modifier: Modifier = Modifier, maxLines: Int = Int.MAX_VALUE) {
     val weight = if (bold) FontWeight.SemiBold else FontWeight.Normal
-    if (mi) MiText(value, modifier = modifier, color = color, fontSize = size.sp, fontWeight = weight)
-    else Text(value, modifier = modifier, color = color, fontSize = size.sp, fontWeight = weight)
+    val overflow = if (maxLines == Int.MAX_VALUE) TextOverflow.Clip else TextOverflow.Ellipsis
+    if (mi) MiText(value, modifier = modifier, color = color, fontSize = size.sp, fontWeight = weight,
+        maxLines = maxLines, overflow = overflow)
+    else Text(value, modifier = modifier, color = color, fontSize = size.sp, fontWeight = weight,
+        maxLines = maxLines, overflow = overflow)
 }
 @Composable fun UButton(text: String, enabled: Boolean = true, primary: Boolean = false,
     modifier: Modifier = Modifier, onClick: () -> Unit) {

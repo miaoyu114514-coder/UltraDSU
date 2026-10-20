@@ -20,6 +20,7 @@ import java.io.File;
 import java.nio.file.Files;
 import java.io.FileInputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.util.zip.GZIPInputStream;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -33,6 +34,10 @@ public final class RootBridge {
     private static File gsidBinary = new File("/system/bin/gsid");
     private static String testedBackportHash = "6bea182e737e238ce8c054717f48e64afc1c8a989aab53850bc9a564651bd323";
     private static File oneShotFile = new File("/metadata/gsi/dsu/one_shot_boot");
+    private static File growthRoot = new File("/data/adb/ultradsu/growth");
+    private static File growthDirectory(String slot) { return new File(growthRoot, slot); }
+    interface BackupDirectorySync { void sync(File directory) throws Exception; }
+    private static BackupDirectorySync backupDirectorySync = NativeGrowthTools::syncDirectory;
     private static final Set<String> READ_ONLY = new HashSet<>(Arrays.asList("system", "system_ext", "product", "vendor", "odm", "vendor_dlkm", "odm_dlkm", "system_dlkm"));
     private static String writingPartition = "system";
     static final class ImageSpec {
@@ -69,6 +74,8 @@ public final class RootBridge {
                 !imageRoot.getCanonicalFile().equals(imageRoot.getAbsoluteFile()) ||
                 !directory.getCanonicalFile().equals(directory.getAbsoluteFile()))
             throw new SecurityException("无效的安装路径或符号链接");
+        if (new File(growthDirectory(slot), "growth.json").exists())
+            throw new IllegalStateException("同名槽仍有扩容恢复记录，请先恢复或清理备份");
         if (!imageRoot.isDirectory()) {
             if (!imageRoot.mkdir()) throw new IllegalStateException("无法创建系统 DSU 数据目录：" + imageRoot);
             directoryLabeler.label(imageRoot);
@@ -122,7 +129,7 @@ public final class RootBridge {
     private static void enable(String slot, boolean oneShot) throws Exception {
         if (!multi()) throw new IllegalStateException("此系统没有命名多槽接口");
         validateSlot(slot);
-        if (maintenance(slot).isFile()) throw new IllegalStateException("此槽有未完成的分区修改，请先修复后再启动");
+        if (maintenance(slot).isFile() || UserdataGrowth.blocked(growthDirectory(slot))) throw new IllegalStateException("此槽有未完成的分区修改或扩容，请先恢复后再启动");
         File marker = new File(slotDirectory(slot), "complete");
         if (!marker.isFile() || !"OK".equals(new String(Files.readAllBytes(marker.toPath()), java.nio.charset.StandardCharsets.UTF_8).trim()))
             throw new IllegalStateException("此槽尚未完成安装，无法启动");
@@ -141,6 +148,7 @@ public final class RootBridge {
         out.put("running", flag("isGsiRunning"));
         out.put("enabled", flag("isGsiEnabled"));
         out.put("installing", flag("isGsiInstallInProgress"));
+        if (out.getBoolean("running")) out.put("guestAssistance", GuestAssistance.status(activeSlot(), false));
         if (multi) {
             List<String> complete = new ArrayList<>();
             for (String slot : slots()) {
@@ -203,6 +211,7 @@ public final class RootBridge {
     @SuppressWarnings("unchecked")
     private static void remove(String target) throws Exception {
         idle();
+        if (new File(growthDirectory(target), "growth.json").exists()) throw new IllegalStateException("此槽保留着扩容备份，请先恢复或确认清理备份再删除槽");
         if (!multi()) {
             if (!"dsu".equals(target)) throw new IllegalArgumentException("仅支持默认槽");
             truth(call("removeGsi")); return;
@@ -252,12 +261,17 @@ public final class RootBridge {
     private static void progress(String text) {
         System.out.println("ULTRADSU_PROGRESS:" + text); System.out.flush();
     }
+    private static void progress(String text, long bytes, long totalBytes) throws Exception {
+        JSONObject event = new JSONObject().put("message", text).put("bytes", bytes).put("totalBytes", totalBytes);
+        System.out.println("ULTRADSU_PROGRESS:" + event); System.out.flush();
+    }
     private static void closePartitionIfSupported() throws Exception {
         try { api.getMethod("closePartition"); }
         catch (NoSuchMethodException ignored) { return; }
         successCode(call("closePartition"));
     }
     private static void writeImage(File file, long size) throws Exception {
+        progress("写入 " + writingPartition, 0, size);
         ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
         AtomicReference<Throwable> failure = new AtomicReference<>();
         Thread writer = new Thread(() -> {
@@ -269,7 +283,7 @@ public final class RootBridge {
                     if (written > size) throw new IllegalStateException("镜像大小与准备结果不一致");
                     output.write(buffer, 0, n);
                     if (System.currentTimeMillis() - reportAt > 1000) {
-                        progress("写入 " + writingPartition + "  " + written / (1024 * 1024) + " / " + size / (1024 * 1024) + " MiB");
+                        progress("写入 " + writingPartition, written, size);
                         reportAt = System.currentTimeMillis();
                     }
                 }
@@ -281,6 +295,7 @@ public final class RootBridge {
         finally { pipe[0].close(); writer.join(10000); }
         if (writer.isAlive()) throw new IllegalStateException("镜像写入线程未结束");
         if (failure.get() != null) throw new IllegalStateException("镜像流失败：" + failure.get());
+        progress("已写入 " + writingPartition, size, size);
     }
     // The stock system installer calls remove() before installing, so named extras alone
     // cannot preserve another installation. This root path never calls global remove().
@@ -330,6 +345,7 @@ public final class RootBridge {
                 installStep("分配 " + image.partition, "createPartition", image.partition, image.bytes, true);
                 imageWriter.write(image.file, image.bytes); closePartitionIfSupported();
             }
+            progress("正在完成安装并校验槽位");
             installStep("完成安装", "closeInstall");
             File complete = new File(slotDirectory(slot), "complete");
             if (!complete.isFile() || !"OK".equals(new String(Files.readAllBytes(complete.toPath()), java.nio.charset.StandardCharsets.UTF_8).trim()))
@@ -375,6 +391,7 @@ public final class RootBridge {
     }
     private static Set<String> pendingPartitions(String slot) throws Exception {
         Set<String> pending = new LinkedHashSet<>(); File file = maintenance(slot);
+        if (UserdataGrowth.blocked(growthDirectory(slot))) pending.add("userdata");
         if (file.isFile()) {
             JSONArray array = new JSONArray(new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
             for (int i = 0; i < array.length(); i++) {
@@ -409,6 +426,8 @@ public final class RootBridge {
     @SuppressWarnings("unchecked")
     private static void mutate(String slot, List<ImageSpec> replacements, long userdata) throws Exception {
         idle(); if (!multi()) throw new IllegalStateException("分区替换需要 Android 11+"); validateSlot(slot);
+        if (UserdataGrowth.blocked(growthDirectory(slot))) throw new IllegalStateException("此槽扩容未完成，请使用扩容备份恢复，不能重写分区");
+        if (userdata > 0 && new File(growthDirectory(slot), "growth.json").exists()) throw new IllegalStateException("请先清理已确认的扩容备份，再执行清空重建");
         if (userdata == 0) validateImages(replacements, false);
         else if (userdata < (1L << 30) || userdata > (512L << 30)) throw new IllegalArgumentException("userdata 容量须在 1–512 GiB");
         File directory = slotDirectory(slot), complete = new File(directory, "complete");
@@ -456,6 +475,7 @@ public final class RootBridge {
                 successCode(call("createPartition", image.partition, image.bytes, true));
                 imageWriter.write(image.file, image.bytes); closePartitionIfSupported();
             }
+            progress("正在确认分区修改结果");
             successCode(call("closeInstall"));
             if (flag("isGsiInstallInProgress")) successCode(call("enableGsi", true, slot));
             Set<String> remaining = new LinkedHashSet<>(originalPending); remaining.removeAll(targets); savePending(slot, remaining);
@@ -473,10 +493,242 @@ public final class RootBridge {
             if (!successful && previous.equals(slot)) progress("该槽需修复，已保持停用");
         }
     }
+    private static long blockSize(File path) throws Exception {
+        java.lang.Process process = new ProcessBuilder("/system/bin/blockdev", "--getsize64", path.getPath()).redirectErrorStream(true).start();
+        try {
+            if (!process.waitFor(5, TimeUnit.SECONDS) || process.exitValue() != 0) throw new IllegalStateException("无法读取块设备容量");
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                return Long.parseLong(reader.readLine().trim());
+            }
+        } finally { process.destroy(); }
+    }
+    private static String growthKeyIdentity(String slot) throws Exception {
+        File key = new File("/metadata/vold/metadata_encryption/dsu/" + slot + "/key/encrypted_key");
+        if (!key.exists()) return "plain";
+        if (!key.getCanonicalFile().equals(key.getAbsoluteFile()) || key.length() > 16384) throw new SecurityException("非标准的槽位密钥记录");
+        return AssistanceProtocol.digest(Files.readAllBytes(key.toPath()));
+    }
+    private static void assistanceHost(String slot) throws Exception {
+        if (flag("isGsiRunning")) throw new IllegalStateException("请先返回主系统"); validateSlot(slot);
+        String path = new String(Files.readAllBytes(new File(slotDirectory(slot), "install_dir").toPath()), StandardCharsets.UTF_8).trim().replaceAll("/+$", "");
+        if (platformSdk < 36 || !multi() || !internalMultiSlot() || !path.equals("/data/gsi/dsu/" + slot))
+            throw new IllegalStateException("客体协作需要 Android 16+ 主系统及标准内部多槽布局");
+    }
+    private static JSONObject assistance(String action, String[] args) throws Exception {
+        if (action.equals("assist-capture") || action.equals("assist-return")) {
+            if (!flag("isGsiRunning")) throw new IllegalStateException("此步骤必须在目标客体系统中完成");
+            String slot = activeSlot(); validateSlot(slot);
+            JSONObject request = GuestAssistance.request(slot);
+            if (action.equals("assist-capture")) {
+                if (GuestAssistance.status(slot, false).optString("phase").equals("CAPTURED")) return GuestAssistance.status(slot, false);
+                JSONObject sealed = NativeGrowthTools.captureGuest(slot, request.getString("session"), request.getString("publicKey"));
+                GuestAssistance.captured(slot, sealed);
+            } else truth(call("disableGsi"));
+            return GuestAssistance.status(slot, false);
+        }
+        String slot = args[1]; assistanceHost(slot);
+        if (!action.equals("assist-info")) idle();
+        File directory = GuestAssistance.directory(slot);
+        File boot = new File(directory, "boot.json");
+        if (action.equals("assist-info") && boot.exists() && !flag("isGsiInstallInProgress")) {
+            if (activeSlot().equals(slot)) restoreGrowthBoot(directory, GuestAssistance.read(directory, "boot.json"));
+            else { Files.delete(boot.toPath()); NativeGrowthTools.syncDirectory(directory); }
+        }
+        switch (action) {
+            case "assist-prepare":
+                if (new File(growthDirectory(slot), "growth.json").exists()) throw new IllegalStateException("请先恢复或清理已有扩容备份，再准备新的协作");
+                GuestAssistance.prepare(slot, args[2], args[3]); break;
+            case "assist-boot":
+                GuestAssistance.request(slot);
+                if (!boot.exists()) saveGrowthBoot(directory, activeSlot(), flag("isGsiEnabled"), oneShotFile.isFile());
+                enable(slot, true); break;
+            case "assist-clear":
+                if (new File(growthDirectory(slot), "growth.json").exists()) throw new IllegalStateException("已有扩容备份，必须保留协作凭据供恢复");
+                if (boot.exists()) restoreGrowthBoot(directory, GuestAssistance.read(directory, "boot.json"));
+                GuestAssistance.clear(slot); break;
+            case "assist-info": break;
+            default: throw new IllegalArgumentException("未知协作操作");
+        }
+        return GuestAssistance.status(slot, action.equals("assist-info"));
+    }
+    private static void saveGrowthBoot(File directory, String active, boolean enabled, boolean once) throws Exception {
+        File temp = new File(directory, "boot.partial"), target = new File(directory, "boot.json");
+        if (!temp.getCanonicalFile().equals(temp.getAbsoluteFile()) || !target.getCanonicalFile().equals(target.getAbsoluteFile())) throw new SecurityException("无效的启动恢复记录");
+        try (java.io.FileOutputStream output = new java.io.FileOutputStream(temp)) {
+            output.write(new JSONObject().put("active", active).put("enabled", enabled).put("once", once).toString().getBytes(StandardCharsets.UTF_8)); output.getFD().sync();
+        }
+        android.system.Os.chmod(temp.getPath(), 0600);
+        Files.move(temp.toPath(), target.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        NativeGrowthTools.syncDirectory(directory);
+    }
+    private static void restoreGrowthBoot(File directory, JSONObject boot) throws Exception {
+        String active = boot.getString("active");
+        if (!active.isEmpty() && active.matches("[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}") && slots().contains(active) &&
+                !maintenance(active).isFile() && !UserdataGrowth.blocked(growthDirectory(active))) {
+            enable(active, boot.getBoolean("once")); if (!boot.getBoolean("enabled")) truth(call("disableGsi"));
+        } else if (flag("isGsiEnabled")) truth(call("disableGsi"));
+        Files.deleteIfExists(new File(directory, "boot.json").toPath()); NativeGrowthTools.syncDirectory(directory);
+    }
+    private static JSONObject growth(String slot, String action, long bytes) throws Exception {
+        if (flag("isGsiRunning")) throw new IllegalStateException("请先返回主系统");
+        if (!multi()) throw new IllegalStateException("设备没有多槽维护接口"); validateSlot(slot);
+        if (maintenance(slot).isFile()) throw new IllegalStateException("请先完成现有分区修复");
+        File slotMeta = slotDirectory(slot), installFile = new File(slotMeta, "install_dir"), complete = new File(slotMeta, "complete");
+        String installPath = new String(Files.readAllBytes(installFile.toPath()), StandardCharsets.UTF_8).trim().replaceAll("/+$", "");
+        if (!installPath.equals("/data/gsi/dsu/" + slot) || !new File(installPath).getCanonicalPath().equals(installPath) || !internalMultiSlot())
+            throw new IllegalStateException("保留数据扩容仅支持已适配的内部多槽标准布局");
+        NativeGrowthTools.privateDirectory(growthRoot.getParentFile()); NativeGrowthTools.privateDirectory(growthRoot);
+        File directory = growthDirectory(slot); NativeGrowthTools.privateDirectory(directory);
+        File bootFile = new File(directory, "boot.json"); JSONObject interruptedBoot = null;
+        if (bootFile.exists()) {
+            if (!bootFile.getCanonicalFile().equals(bootFile.getAbsoluteFile()) || bootFile.length() > 4096) throw new SecurityException("启动恢复记录损坏");
+            interruptedBoot = new JSONObject(new String(Files.readAllBytes(bootFile.toPath()), StandardCharsets.UTF_8));
+        }
+        if (flag("isGsiInstallInProgress")) {
+            if (interruptedBoot == null || !installPath.equals(String.valueOf(call("getInstalledGsiImageDir")).replaceAll("/+$", "")))
+                throw new IllegalStateException("其他 DSU 安装会话正在进行，拒绝接管");
+            successCode(call("closeInstall"));
+        }
+        if (interruptedBoot != null) restoreGrowthBoot(directory, interruptedBoot);
+        Object images = call("openImageService", "dsu/" + slot);
+        File journalFile = new File(directory, "growth.json");
+        if (journalFile.exists() && journalFile.length() <= 8192) {
+            String phase = new JSONObject(new String(Files.readAllBytes(journalFile.toPath()), StandardCharsets.UTF_8)).getString("phase");
+            if (!phase.equals("EXPANDED") && !phase.equals("ROLLED_BACK") && !phase.equals("ROLLED_BACK_RAW")) {
+                NativeGrowthTools.run("cleanup", slot, new File("/dev/block/dm-0"));
+                if (Boolean.TRUE.equals(imageCall(images, "isImageMapped", "userdata_gsi"))) imageCall(images, "unmapImageDevice", "userdata_gsi");
+            }
+        }
+        if (Boolean.TRUE.equals(imageCall(images, "isImageMapped", "userdata_gsi"))) throw new IllegalStateException("userdata 当前仍映射，拒绝扩容");
+        String previous = activeSlot(); boolean wasEnabled = flag("isGsiEnabled"), once = oneShotFile.isFile();
+        boolean[] opened = {false};
+        UserdataGrowth.Backend backend = new UserdataGrowth.Backend() {
+            public UserdataGrowth.Mapping map() throws Exception {
+                if (Boolean.TRUE.equals(imageCall(images, "isImageMapped", "userdata_gsi"))) throw new IllegalStateException("userdata 已被其他操作映射");
+                Object mapping = Class.forName("android.gsi.MappedImage").getConstructor().newInstance();
+                imageCall(images, "mapImageDevice", "userdata_gsi", 10000, mapping);
+                String path = (String)mapping.getClass().getField("path").get(mapping);
+                if (!path.matches("/dev/block/dm-[0-9]+")) { imageCall(images,"unmapImageDevice","userdata_gsi"); throw new SecurityException("非标准 DSU 块映射"); }
+                return new UserdataGrowth.Mapping() {
+                    public File device() { return new File(path); }
+                    public void close() throws Exception { imageCall(images, "unmapImageDevice", "userdata_gsi"); }
+                };
+            }
+            public long size() throws Exception { try (UserdataGrowth.Mapping mapping = map()) { return blockSize(mapping.device()); } }
+            public JSONObject inspect(boolean check) throws Exception {
+                try (UserdataGrowth.Mapping mapping = map()) { return NativeGrowthTools.run(check ? "check" : "probe", slot, mapping.device()).put("assisted", NativeGrowthTools.assisted()); }
+            }
+            public String keyIdentity() throws Exception {
+                return growthKeyIdentity(slot);
+            }
+            public void allocate(long target) throws Exception {
+                if (!opened[0]) {
+                    saveGrowthBoot(directory, previous, wasEnabled, once);
+                    if (previous.equals(slot) && flag("isGsiEnabled")) truth(call("disableGsi"));
+                    successCode(call("openInstall", installPath)); opened[0] = true;
+                    Files.write(complete.toPath(), "OK".getBytes(StandardCharsets.UTF_8));
+                }
+                progress("分配 userdata，完整恢复备份已保留");
+                installStep("分配 userdata", "createPartition", "userdata", target, false); closePartitionIfSupported();
+            }
+            public void expand(long oldFs, long target) throws Exception {
+                try (UserdataGrowth.Mapping mapping = map()) { NativeGrowthTools.run("resize", slot, mapping.device(), oldFs, target); }
+            }
+            public void syncDirectory(File folder) throws Exception { NativeGrowthTools.syncDirectory(folder); }
+        };
+        UserdataGrowth transaction = new UserdataGrowth(directory, backend, RootBridge::progress);
+        try {
+            switch (action) {
+                case "grow-info":
+                    JSONObject info = new JSONObject().put("growth", transaction.status()).put("assistance", GuestAssistance.status(slot, false));
+                    try { info.put("filesystem", backend.inspect(true)); info.put("supported", true); }
+                    catch (Exception problem) {
+                        String reason = String.valueOf(problem.getMessage());
+                        info.put("supported", false).put("reason", reason).put("canAssist", !info.getJSONObject("growth").optBoolean("exists") &&
+                            (reason.contains("Cannot unseal") || reason.contains("FBE key records")));
+                    }
+                    return info;
+                case "grow":
+                    if (bytes < (1L << 30) || bytes > (512L << 30)) throw new IllegalArgumentException("新容量须为 1–512 GiB");
+                    long reserve = 0;
+                    if (Boolean.TRUE.equals(Class.forName("android.os.SystemProperties").getMethod("getBoolean", String.class, boolean.class)
+                            .invoke(null, "ro.virtual_ab.enabled", false))) reserve = blockSize(new File("/dev/block/by-name/super"));
+                    if (directory.getUsableSpace() < backend.size() + bytes + reserve + (256L << 20))
+                        throw new IllegalStateException("空间不足：需同时容纳完整备份、新镜像及系统 Virtual A/B 预留空间");
+                    transaction.grow(bytes); break;
+                case "grow-rollback": transaction.rollback(); break;
+                case "grow-discard": transaction.discard(); break;
+                default: throw new IllegalArgumentException("未知扩容操作");
+            }
+            return new JSONObject().put("growth", transaction.status());
+        } finally {
+            if (opened[0]) {
+                // Never cancelGsiInstall: it may remove other partitions in this slot.
+                successCode(call("closeInstall"));
+                restoreGrowthBoot(directory, new JSONObject().put("active", previous).put("enabled", wasEnabled).put("once", once));
+            }
+        }
+    }
+    /** Listing and cleanup need neither a native resizer nor access to encryption keys. */
+    private static JSONObject userdataBackups(String deleteSlot, String kind, String revision) throws Exception {
+        idle();
+        List<String> installed = multi() ? slots() : (flag("isGsiInstalled") ? Arrays.asList("dsu") : new ArrayList<>());
+        JSONArray entries = new JSONArray(); List<File> protectedFiles = new ArrayList<>();
+        String protectionError = "";
+        for (String slot : installed) {
+            if (!slot.matches("[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}")) throw new SecurityException("系统槽列表含无效标识");
+            long bytes = 0; String detail = "槽当前绑定的 userdata，不可删除（未启动时同样受保护）";
+            try {
+                File record = new File(slotDirectory(slot), "install_dir");
+                if (!record.getCanonicalFile().equals(record.getAbsoluteFile()) || !record.isFile() || record.length() > 4096)
+                    throw new SecurityException();
+                File dir = new File(new String(Files.readAllBytes(record.toPath()), StandardCharsets.UTF_8).trim());
+                if (!imageRoot.getCanonicalFile().equals(imageRoot.getAbsoluteFile()) ||
+                    !dir.getCanonicalFile().equals(dir.getAbsoluteFile()) ||
+                    (!dir.equals(imageRoot) && !dir.equals(new File(imageRoot, slot)))) throw new SecurityException();
+                File[] files = dir.listFiles(); if (files == null) throw new IllegalStateException();
+                boolean found = false;
+                for (File file : files) {
+                    if (!file.getName().matches("userdata_gsi\\.img(?:\\.[0-9]+)?")) continue;
+                    if (!file.getCanonicalFile().equals(file.getAbsoluteFile()) || !file.isFile()) throw new SecurityException();
+                    protectedFiles.add(file); found = true;
+                    if (!file.getName().equals("userdata_gsi.img")) bytes = Math.addExact(bytes, file.length());
+                }
+                if (!found) throw new IllegalStateException();
+            } catch (Exception unavailable) {
+                detail = "无法完整核实在用 userdata，仍禁止删除";
+                protectionError = "无法核实全部在用镜像，已保护备份；请检查槽位布局后刷新";
+            }
+            entries.put(new JSONObject().put("slot", slot).put("kind", "current").put("bytes", bytes)
+                .put("modified", 0).put("canDelete", false).put("reason", detail));
+        }
+        UserdataBackupStore store = new UserdataBackupStore(growthRoot, protectedFiles, backupDirectorySync::sync);
+        if (deleteSlot != null) {
+            if (!"growth".equals(kind)) throw new SecurityException("槽当前绑定的 userdata 不可删除");
+            if (!protectionError.isEmpty()) throw new IllegalStateException(protectionError);
+            // A maintenance marker can be the only evidence of another interrupted transaction.
+            if (maintenance(deleteSlot).exists()) throw new IllegalStateException("此槽仍需修复，恢复备份不可删除");
+            store.delete(deleteSlot, kind, revision);
+        }
+        JSONArray backups = store.list();
+        for (int i = 0; i < backups.length(); i++) {
+            JSONObject row = backups.getJSONObject(i);
+            if (!protectionError.isEmpty() || maintenance(row.getString("slot")).exists())
+                row.put("canDelete", false).put("reason", protectionError.isEmpty() ? "此槽仍需修复，恢复备份不可删除" : protectionError);
+            entries.put(row);
+        }
+        return new JSONObject().put("entries", entries);
+    }
     public static void main(String[] args) {
         JSONObject out = new JSONObject();
+        RandomAccessFile lockFile = null; java.nio.channels.FileLock lock = null;
         try {
             if (Process.myUid() != 0) throw new SecurityException("Root required");
+            File operationRoot = new File("/data/adb/ultradsu"); NativeGrowthTools.privateDirectory(operationRoot);
+            File lockPath = new File(operationRoot, "operation.lock");
+            if (!lockPath.getCanonicalFile().equals(lockPath.getAbsoluteFile())) throw new SecurityException("无效的操作锁");
+            lockFile = new RandomAccessFile(lockPath, "rw"); lock = lockFile.getChannel().tryLock();
+            if (lock == null) throw new IllegalStateException("另一个 UltraDSU 操作正在进行");
             // app_process runs outside an app sandbox; exempt reflection on hidden platform APIs.
             Class<?> vm = Class.forName("dalvik.system.VMRuntime");
             Object runtime = vm.getDeclaredMethod("getRuntime").invoke(null);
@@ -487,7 +739,22 @@ public final class RootBridge {
             if (binder == null) throw new IllegalStateException("设备未提供 gsid 服务");
             api = Class.forName("android.gsi.IGsiService");
             service = Class.forName("android.gsi.IGsiService$Stub").getMethod("asInterface", IBinder.class).invoke(null, binder);
+            if (args.length > 0 && args[args.length - 1].equals("--assist")) {
+                args = Arrays.copyOf(args, args.length - 1);
+                if (!Arrays.asList("grow-info", "grow", "grow-rollback").contains(args[0]) || flag("isGsiRunning")) throw new SecurityException("不允许使用协作交接");
+                validateSlot(args[1]);
+                android.system.Os.prctl(android.system.OsConstants.PR_SET_DUMPABLE, 0, 0, 0, 0);
+                byte[] packet = new byte[196];
+                try {
+                    new java.io.DataInputStream(System.in).readFully(packet);
+                    if (System.in.read() != -1) throw new SecurityException("协作交接数据过多");
+                    AssistanceProtocol.validatePacket(packet, GuestAssistance.request(args[1]), growthKeyIdentity(args[1]));
+                    NativeGrowthTools.setAssistance(args[1], packet);
+                } finally { Arrays.fill(packet, (byte)0); }
+            }
             switch (args[0]) {
+                case "assist-info": case "assist-prepare": case "assist-boot": case "assist-clear":
+                case "assist-capture": case "assist-return": out = assistance(args[0], args); break;
                 case "status": out = status(); break;
                 case "enable":
                     idle();
@@ -507,8 +774,12 @@ public final class RootBridge {
                 case "install-package":
                     installImages(args[1], readManifest(new File(args[2])), Long.parseLong(args[3])); break;
                 case "images": out = inventory(args[1]); break;
+                case "userdata-backups": out = userdataBackups(null, null, null); break;
+                case "userdata-backup-delete": out = userdataBackups(args[1], args[2], args[3]); break;
                 case "replace": mutate(args[1], readManifest(new File(args[2])), 0); break;
                 case "resize": mutate(args[1], new ArrayList<>(), Long.parseLong(args[2])); break;
+                case "grow-info": case "grow-rollback": case "grow-discard": out = growth(args[1], args[0], 0); break;
+                case "grow": out = growth(args[1], args[0], Long.parseLong(args[2])); break;
                 default: throw new IllegalArgumentException("Unknown operation");
             }
             out.put("ok", true);
@@ -516,6 +787,9 @@ public final class RootBridge {
             while (e instanceof InvocationTargetException && e.getCause() != null) e = e.getCause();
             try { out.put("ok", false); out.put("error", e.getClass().getSimpleName() + ": " + e.getMessage()); }
             catch (Exception ignored) { }
+        } finally {
+            NativeGrowthTools.clearAssistance();
+            try { if (lock != null) lock.release(); if (lockFile != null) lockFile.close(); } catch (Exception ignored) { }
         }
         System.out.println("ULTRADSU:" + out);
         System.exit(0);

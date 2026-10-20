@@ -57,6 +57,8 @@ private data class Confirmation(val title: String, val text: String, val action:
     UltraTheme(state.style) {
         Box(Modifier.fillMaxSize()) {
             AppBody(model, state, prep)
+            OperationBubble(prep, state.operationLabel.takeIf { state.busy },
+                onCancel = model::cancelPreparation, onDismiss = model::dismissTaskResult)
             // SuperDialog registers content with this host. Keep it above the page
             // and glass layer so modal content is visible and receives input.
             if (state.style == UiStyle.MIUIX) MiuixPopupHost()
@@ -68,6 +70,8 @@ private data class Confirmation(val title: String, val text: String, val action:
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var create by rememberSaveable { mutableStateOf(false) }
     var editingId by rememberSaveable { mutableStateOf<String?>(null) }
+    var managingBackups by rememberSaveable { mutableStateOf(false) }
+    var backupSlot by rememberSaveable { mutableStateOf<String?>(null) }
     var commandSlot by remember { mutableStateOf<DsuSlot?>(null) }
     var bootSlot by remember { mutableStateOf<DsuSlot?>(null) }
     var confirmation by remember { mutableStateOf<Confirmation?>(null) }
@@ -89,19 +93,29 @@ private data class Confirmation(val title: String, val text: String, val action:
     val backdrop = rememberGraphicsLayer()
     var backdropOrigin by remember { mutableStateOf(Offset.Zero) }
     val editingSlot = state.slots.find { it.id == editingId }
+    val screenKey = if (managingBackups && state.root) USERDATA_BACKUPS_SCREEN else editingSlot?.id
     val screenState = rememberSaveableStateHolder()
     val tabState = rememberSaveableStateHolder()
 
-    AnimatedContent(targetState = editingSlot?.id,
+    AnimatedContent(targetState = screenKey,
         modifier = Modifier.fillMaxSize().background(pageColor).clipToBounds(),
         transitionSpec = { slotScreenTransition() }, label = "slot screen") { screenId ->
-    val activeScreen = screenId == editingSlot?.id
+    val activeScreen = screenId == screenKey
     val screenSettled = transition.currentState == EnterExitState.Visible && transition.targetState == EnterExitState.Visible
-    if (screenId != null) {
+    if (screenId == USERDATA_BACKUPS_SCREEN) {
+        Box(Modifier.fillMaxSize().transitionInput(activeScreen)) {
+            UserdataBackupsScreen(model, state, locked || !activeScreen, backupSlot,
+                onBack = { managingBackups = false }, backEnabled = activeScreen && confirmation == null,
+                readReady = screenSettled && activeScreen) { title, text, action ->
+                confirmation = Confirmation(title, text, action)
+            }
+        }
+    } else if (screenId != null) {
         state.slots.find { it.id == screenId }?.let { slot ->
             Box(Modifier.fillMaxSize().transitionInput(activeScreen)) {
-                SlotEditorScreen(model, state, slot, locked || !activeScreen, prep,
+                SlotEditorScreen(model, state, slot, locked || !activeScreen,
                     onBack = { editingId = null }, backEnabled = activeScreen && confirmation == null,
+                    onManageBackups = { backupSlot = slot.slotName; managingBackups = true },
                     readReady = screenSettled && activeScreen) { title, text, action ->
                     confirmation = Confirmation(title, text, action)
                 }
@@ -145,14 +159,8 @@ private data class Confirmation(val title: String, val text: String, val action:
                         UButton("知道了", onClick = model::dismissMessage)
                     }
                 }
-                if (locked) item(key = "operation") {
-                    UCard {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            CircularProgressIndicator(Modifier.size(22.dp), color = accent, strokeWidth = 2.dp)
-                            UText(if (prep.busy) prep.message else "正在执行操作…", 14)
-                        }
-                        if (prep.busy && !prep.installation) UButton("取消准备", onClick = model::cancelPreparation)
-                    }
+                if (page != 2 && state.root && state.device.running && state.guestAssistance != null) item(key = "guest-assistance") {
+                    GuestAssistanceCard(model, state, !locked) { title, text, action -> confirmation = Confirmation(title, text, action) }
                 }
                 if (page == 0) {
                     item { Hero(state, onCreate = { create = true }, enabled = !locked && canInstall) }
@@ -240,6 +248,16 @@ private data class Confirmation(val title: String, val text: String, val action:
                             }
                             if (state.root) UText("Root 已授权 · 所有系统管理操作仍会校验槽位状态。", 13, color = Color(0xFF25977B))
                             else if (state.rootRequested) UButton("重新检查 Root 授权", !locked) { model.rootEnabled(true) }
+                        }
+                    }
+                    item { DebugSettings(model, state, locked) }
+                    if (state.root) item(key = "userdata-backups") {
+                        UCard {
+                            UText("userdata 备份管理", 18, true)
+                            UText("查看各槽的在用分区与独立备份，清理不再需要的备份空间。", 13, color = mutedColor)
+                            UButton("管理 userdata 备份", !locked, modifier = Modifier.fillMaxWidth()) {
+                                backupSlot = null; managingBackups = true
+                            }
                         }
                     }
                     item { Compatibility(state) }

@@ -120,7 +120,7 @@ class ArchiveDeviceTest {
                     }
                 }
                 if (native) {
-                    try { NativeSevenZip.read(source) { name, directory, input ->
+                    try { NativeSevenZip.read(source) { name, directory, _, input ->
                         if (!directory && name.endsWith(".img")) { consume(input); throw SampleComplete() }
                     } } catch (_: SampleComplete) { }
                 } else org.apache.commons.compress.archivers.sevenz.SevenZFile.builder().setFile(source).get().use { seven ->

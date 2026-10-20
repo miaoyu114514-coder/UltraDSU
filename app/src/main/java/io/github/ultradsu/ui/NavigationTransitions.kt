@@ -25,14 +25,18 @@ internal fun AnimatedContentTransitionScope<Int>.tabContentTransition(): Content
 }
 
 /** Push the editor over a parallax list; pop keeps the departing editor on top. */
+internal const val USERDATA_BACKUPS_SCREEN = "userdata-backups"
+
 internal fun AnimatedContentTransitionScope<String?>.slotScreenTransition(): ContentTransform {
     val spec = tween<androidx.compose.ui.unit.IntOffset>(360, easing = FastOutSlowInEasing)
-    val transform = if (targetState != null) {
+    // The backup manager can be opened above an editor as well as above Settings.
+    val forward = targetState != null && initialState != USERDATA_BACKUPS_SCREEN
+    val transform = if (forward) {
         slideInHorizontally(spec) { it } togetherWith slideOutHorizontally(spec) { -it / 3 }
     } else {
         slideInHorizontally(spec) { -it / 3 } togetherWith slideOutHorizontally(spec) { it }
     }
-    transform.targetContentZIndex = if (targetState != null) 1f else 0f
+    transform.targetContentZIndex = if (forward) 1f else 0f
     return transform.using(SizeTransform(clip = false))
 }
 

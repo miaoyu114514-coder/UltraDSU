@@ -1,0 +1,11 @@
+// Build an isolated test application, keeping the user's installed UltraDSU data separate.
+allprojects { p ->
+    p.plugins.withId('com.android.application') {
+        p.extensions.getByName('androidComponents').finalizeDsl { android ->
+            android.defaultConfig.applicationId = 'io.github.ultradsu.progressverify'
+            android.defaultConfig.testApplicationId = 'io.github.ultradsu.progressverify.test'
+            android.sourceSets.getByName('debug').java.srcDir(p.file('src/androidTest/fixtures/java'))
+            android.sourceSets.getByName('debug').manifest.srcFile(p.file('src/androidTest/fixtures/AndroidManifest.xml'))
+        }
+    }
+}

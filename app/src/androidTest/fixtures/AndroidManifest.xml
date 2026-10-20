@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Included only by tools/progress-ui-test.init.gradle in the isolated app. -->
+        <provider android:name="io.github.ultradsu.ProgressImageProvider"
+            android:authorities="io.github.ultradsu.progress.fixture" android:exported="false" />
+    </application>
+</manifest>
