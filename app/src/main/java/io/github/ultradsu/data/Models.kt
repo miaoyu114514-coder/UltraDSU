@@ -45,6 +45,7 @@ data class DsuSlot(
     val images: List<PartitionImage> = emptyList(),
     val pendingImages: List<PartitionImage> = emptyList(),
     val pendingSourceName: String = "",
+    val preparedFilesCleaned: Boolean = false,
 ) {
     val userdataBytes: Long get() = userdataGiB * GIB
 }

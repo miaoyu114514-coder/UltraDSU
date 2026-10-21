@@ -41,6 +41,10 @@ import io.github.ultradsu.data.*
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) model.stageImages(slot, uri, model.sourceName(uri), target)
     }
+    var exportTarget by rememberSaveable(slot.id) { mutableStateOf("") }
+    val exportPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        if (uri != null && exportTarget.isNotBlank()) model.exportPartition(slot, exportTarget, uri)
+    }
     BackHandler(enabled = backEnabled, onBack = onBack)
     LaunchedEffect(slot.id, canManage, locked, readReady) {
         if (readReady && canManage && !locked && !autoReadRequested) {
@@ -85,6 +89,7 @@ import io.github.ultradsu.data.*
                 if (slot.sourceName.isNotBlank() || slot.images.isNotEmpty()) UCard {
                     UText("镜像信息", 18, true)
                     if (slot.sourceName.isNotBlank()) UText(slot.sourceName, 13, color = mutedColor)
+                    if (slot.preparedFilesCleaned) UText("安装后的准备文件已自动清理，槽内分区保留。", 12, color = mutedColor)
                     slot.images.forEach { image -> UText("${image.partition} · ${"%.2f".format(image.bytes.toDouble() / GIB)} GiB", 13, color = mutedColor) }
                 }
                 if (showPartitions) {
@@ -94,6 +99,7 @@ import io.github.ultradsu.data.*
                     }
                     UCard {
                         UText("槽内镜像", 18, true)
+                        UText("提取为完整 raw .img，保存位置需要足够空间；userdata 导出的是原始加密镜像，不能直接读取其中的文件。", 12, color = mutedColor)
                         if (inventory?.pending?.isNotEmpty() == true) {
                             UText("待修复：${inventory.pending.joinToString()}。已阻止此槽启动，请重新写入对应分区；其他分区保留。", 13, color = Color(0xFFC13D42))
                         }
@@ -107,6 +113,11 @@ import io.github.ultradsu.data.*
                                 }
                                 if (image.name in PartitionRules.readOnly) UButton("替换", !locked && canManage && !image.mapped) {
                                     target = image.name; picker.launch(arrayOf("*/*"))
+                                }
+                                if (image.name in PartitionRules.readOnly || image.name == "userdata") UButton("提取",
+                                    !locked && canManage && !image.mapped && image.bytes > 0 && image.name !in inventory.pending) {
+                                    exportTarget = image.name
+                                    exportPicker.launch("${slot.slotName}-${image.name}.img")
                                 }
                             }
                         }

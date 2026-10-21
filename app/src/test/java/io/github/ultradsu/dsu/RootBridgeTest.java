@@ -93,6 +93,9 @@ public class RootBridgeTest {
     @Before public void setup() throws Exception {
         root = temporary.newFolder("dsu"); gsi = new FakeGsi(root);
         set("api", FakeGsi.class); set("service", gsi); set("metadataRoot", root);
+        Field cancellation = RootBridge.class.getDeclaredField("cancellationRequested"); cancellation.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicBoolean)cancellation.get(null)).set(false);
+        set("cancellationEnabled", false); set("acceptingCancellation", false); set("exportMode", false);
         set("platformSdk", 35);
         set("gsidBinary", new File(temporary.getRoot(), "missing-gsid"));
         set("testedBackportHash", "6bea182e737e238ce8c054717f48e64afc1c8a989aab53850bc9a564651bd323");
@@ -209,6 +212,80 @@ public class RootBridgeTest {
     private void install(String name) throws Exception {
         File source = temporary.newFile(name + ".img.gz");
         invoke("install", new Class[]{String.class, File.class, long.class, long.class}, name, source, 1L << 30, 4096L);
+    }
+    private void cancel() throws Exception {
+        Field f = RootBridge.class.getDeclaredField("cancellationRequested"); f.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicBoolean)f.get(null)).set(true);
+    }
+    @Test public void cancelledInstallCleansOnlyItsNewSlotAndKeepsPriorBootSelection() throws Exception {
+        gsi.enabled = true;
+        set("imageWriter", (RootBridge.ImageWriter)(file,size) -> { cancel(); throw new java.util.concurrent.CancellationException(); });
+        try { install("gamma"); fail(); } catch(java.util.concurrent.CancellationException expected) { }
+        assertEquals(Arrays.asList("alpha","beta"),gsi.getInstalledDsuSlots());
+        assertEquals("alpha",gsi.active); assertTrue(gsi.enabled); assertFalse(gsi.installing);
+        assertEquals(0,gsi.globalRemoveCalls); assertTrue(gsi.images.get("gamma").names.isEmpty());
+    }
+    @Test public void cancellationBeforeInstallationDoesNotAllocateAnything() throws Exception {
+        cancel();
+        try { install("gamma"); fail(); } catch(java.util.concurrent.CancellationException expected) { }
+        assertTrue(gsi.changedPartitions.isEmpty()); assertEquals(Arrays.asList("alpha","beta"),gsi.getInstalledDsuSlots());
+    }
+    public static class BlockingGsi extends FakeGsi {
+        final java.util.concurrent.CountDownLatch allocating = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch aborted = new java.util.concurrent.CountDownLatch(1);
+        BlockingGsi(File root) { super(root); }
+        @Override public int createPartition(String name,long size,boolean readOnly) {
+            super.createPartition(name,size,readOnly); allocating.countDown();
+            try { if(!aborted.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("Allocation was not interrupted"); }
+            catch(InterruptedException e){throw new AssertionError(e);}
+            return 1;
+        }
+        @Override public boolean cancelGsiInstall() { aborted.countDown(); return super.cancelGsiInstall(); }
+    }
+    @Test public void cooperativeCancelInterruptsAnOutstandingGsidAllocationBeforeCleanup() throws Exception {
+        BlockingGsi blocking=new BlockingGsi(root); blocking.images.putAll(gsi.images); gsi=blocking; set("service",gsi);
+        set("cancellationEnabled",true); set("acceptingCancellation",true);
+        Thread user=new Thread(()->{
+            try { assertTrue(blocking.allocating.await(3,java.util.concurrent.TimeUnit.SECONDS)); invoke("requestCancellation",new Class[0]); }
+            catch(Exception error){throw new AssertionError(error);}
+        }); user.start();
+        try { install("gamma"); fail(); } catch(java.util.concurrent.CancellationException expected) { }
+        finally { user.join(5000); }
+        assertFalse(user.isAlive()); assertFalse(gsi.installing);
+        assertEquals(Arrays.asList("alpha","beta"),gsi.getInstalledDsuSlots()); assertEquals(0,gsi.globalRemoveCalls);
+    }
+    @Test public void exportIsReadOnlyAndReleasesMappingOnSuccessAndCancellation() throws Exception {
+        final int[] opened={0}, closed={0};
+        set("exportOpener",(RootBridge.ExportOpener)(images,name) -> {
+            opened[0]++;
+            return new RootBridge.ExportSource() {
+                public long size(){return 4096;}
+                public java.io.InputStream input(){return new java.io.ByteArrayInputStream(new byte[4096]);}
+                public void close(){closed[0]++;}
+            };
+        });
+        java.io.ByteArrayOutputStream output=new java.io.ByteArrayOutputStream();
+        org.json.JSONObject result=(org.json.JSONObject)invoke("exportPartition",new Class[]{String.class,String.class,java.io.OutputStream.class},"beta","system",output);
+        assertEquals(4096,result.getLong("bytes")); assertEquals(4096,output.size()); assertEquals(1,closed[0]);
+        assertEquals("alpha",gsi.active); assertEquals(2,gsi.images.get("beta").names.size()); assertTrue(gsi.changedPartitions.isEmpty());
+        java.io.OutputStream cancelOutput=new java.io.OutputStream(){public void write(int value)throws java.io.IOException{try{cancel();}catch(Exception e){throw new java.io.IOException(e);}}};
+        try { invoke("exportPartition",new Class[]{String.class,String.class,java.io.OutputStream.class},"beta","system",cancelOutput); fail(); }
+        catch(java.util.concurrent.CancellationException expected) { }
+        assertEquals(2,closed[0]); assertEquals(2,opened[0]); assertTrue(gsi.changedPartitions.isEmpty());
+    }
+    @Test public void exportRejectsMappedMissingUnknownAndPendingPartitionsBeforeOpening() throws Exception {
+        set("exportOpener",(RootBridge.ExportOpener)(images,name) -> {throw new AssertionError("Must not map");});
+        gsi.images.get("beta").mapped=true;
+        try { invoke("exportPartition",new Class[]{String.class,String.class,java.io.OutputStream.class},"beta","system",new java.io.ByteArrayOutputStream()); fail(); }
+        catch(IllegalStateException expected) { }
+        gsi.images.get("beta").mapped=false;
+        for(String partition:Arrays.asList("boot","vendor")) {
+            try { invoke("exportPartition",new Class[]{String.class,String.class,java.io.OutputStream.class},"beta",partition,new java.io.ByteArrayOutputStream()); fail(); }
+            catch(IllegalArgumentException|IllegalStateException expected) { }
+        }
+        Files.write(new File(root,"beta/ultradsu_maintenance.json").toPath(),"[\"system\"]".getBytes());
+        try { invoke("exportPartition",new Class[]{String.class,String.class,java.io.OutputStream.class},"beta","system",new java.io.ByteArrayOutputStream()); fail(); }
+        catch(IllegalStateException expected) { }
     }
     @Test public void installingNewSlotNeverInvokesGlobalRemoveAndPreservesPriorSelection() throws Exception {
         gsi.enabled = true;

@@ -23,6 +23,11 @@ import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.util.zip.GZIPInputStream;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CancellationException;
 
 /** Root-only app_process entry point. Uses the device's own AIDL Proxy, never hardcoded transactions. */
 public final class RootBridge {
@@ -40,6 +45,48 @@ public final class RootBridge {
     private static BackupDirectorySync backupDirectorySync = NativeGrowthTools::syncDirectory;
     private static final Set<String> READ_ONLY = new HashSet<>(Arrays.asList("system", "system_ext", "product", "vendor", "odm", "vendor_dlkm", "odm_dlkm", "system_dlkm"));
     private static String writingPartition = "system";
+    private static final AtomicBoolean cancellationRequested = new AtomicBoolean();
+    private static boolean cancellationEnabled;
+    private static boolean acceptingCancellation;
+    private static boolean exportMode;
+    private static synchronized void requestCancellation() {
+        if (acceptingCancellation) cancellationRequested.set(true);
+    }
+    private static void checkpoint() {
+        if (cancellationRequested.get()) throw new CancellationException("任务已取消");
+    }
+    private static synchronized void finishCancellation() throws Exception {
+        checkpoint(); acceptingCancellation = false;
+        JSONObject event = new JSONObject().put("message", exportMode ? "正在校验导出结果" : "正在完成安装并恢复启动选择")
+            .put("cancellable", false);
+        (exportMode ? System.err : System.out).println("ULTRADSU_PROGRESS:" + event);
+    }
+    // Only the owning install invokes cancelGsiInstall, while its own allocation
+    // is outstanding. The stdin monitor itself never calls a global Binder API.
+    private static Object installCall(String method, Object... args) throws Exception {
+        checkpoint();
+        if (!cancellationEnabled) return call(method, args);
+        FutureTask<Object> task = new FutureTask<>(() -> call(method, args));
+        Thread binder = new Thread(task, "UltraDSU-install-binder"); binder.start();
+        try {
+            for (;;) {
+                try { Object result = task.get(100, TimeUnit.MILLISECONDS); checkpoint(); return result; }
+                catch (TimeoutException waiting) {
+                    if (cancellationRequested.get()) {
+                        // gsid sets its abort flag before waiting for the allocation lock.
+                        truth(call("cancelGsiInstall"));
+                        try { task.get(); } catch (ExecutionException ignored) { }
+                        checkpoint();
+                    }
+                }
+            }
+        } catch (ExecutionException error) {
+            checkpoint();
+            Throwable cause = error.getCause();
+            if (cause instanceof Exception) throw (Exception)cause;
+            throw new IllegalStateException(cause);
+        } finally { binder.join(); }
+    }
     static final class ImageSpec {
         final String partition; final File file; final long bytes;
         ImageSpec(String partition, File file, long bytes) { this.partition = partition; this.file = file; this.bytes = bytes; }
@@ -259,11 +306,13 @@ public final class RootBridge {
         Files.deleteIfExists(maintenance(target).toPath());
     }
     private static void progress(String text) {
-        System.out.println("ULTRADSU_PROGRESS:" + text); System.out.flush();
+        java.io.PrintStream output = exportMode ? System.err : System.out;
+        output.println("ULTRADSU_PROGRESS:" + text); output.flush();
     }
     private static void progress(String text, long bytes, long totalBytes) throws Exception {
         JSONObject event = new JSONObject().put("message", text).put("bytes", bytes).put("totalBytes", totalBytes);
-        System.out.println("ULTRADSU_PROGRESS:" + event); System.out.flush();
+        java.io.PrintStream output = exportMode ? System.err : System.out;
+        output.println("ULTRADSU_PROGRESS:" + event); output.flush();
     }
     private static void closePartitionIfSupported() throws Exception {
         try { api.getMethod("closePartition"); }
@@ -279,6 +328,7 @@ public final class RootBridge {
                  OutputStream output = new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])) {
                 byte[] buffer = new byte[1024 * 1024]; long written = 0, reportAt = 0;
                 for (int n; (n = input.read(buffer)) != -1; ) {
+                    checkpoint();
                     written += n;
                     if (written > size) throw new IllegalStateException("镜像大小与准备结果不一致");
                     output.write(buffer, 0, n);
@@ -291,7 +341,7 @@ public final class RootBridge {
             } catch (Throwable e) { failure.set(e); try { pipe[1].close(); } catch (Exception ignored) { } }
         }, "UltraDSU-image-writer");
         writer.start();
-        try { truth(call("commitGsiChunkFromStream", pipe[0], size)); }
+        try { truth(installCall("commitGsiChunkFromStream", pipe[0], size)); }
         finally { pipe[0].close(); writer.join(10000); }
         if (writer.isAlive()) throw new IllegalStateException("镜像写入线程未结束");
         if (failure.get() != null) throw new IllegalStateException("镜像流失败：" + failure.get());
@@ -322,6 +372,7 @@ public final class RootBridge {
         return images;
     }
     private static void installImages(String slot, List<ImageSpec> images, long userdata) throws Exception {
+        checkpoint();
         idle();
         if (!multi()) throw new IllegalStateException("内置多槽安装需要 Android 11+ 命名接口");
         slotDirectory(slot);
@@ -338,13 +389,15 @@ public final class RootBridge {
             installStep("打开安装目录 " + directory, "openInstall", directory.getPath());
             opened = true;
             progress("分配 userdata，可能需要数分钟");
-            installStep("分配 userdata", "createPartition", "userdata", userdata, false); closePartitionIfSupported();
+            successCode(installCall("createPartition", "userdata", userdata, false)); closePartitionIfSupported();
             for (ImageSpec image : images) {
+                checkpoint();
                 writingPartition = image.partition;
                 progress("分配 " + image.partition + "，可能需要数分钟");
-                installStep("分配 " + image.partition, "createPartition", image.partition, image.bytes, true);
+                successCode(installCall("createPartition", image.partition, image.bytes, true));
                 imageWriter.write(image.file, image.bytes); closePartitionIfSupported();
             }
+            finishCancellation();
             progress("正在完成安装并校验槽位");
             installStep("完成安装", "closeInstall");
             File complete = new File(slotDirectory(slot), "complete");
@@ -368,8 +421,63 @@ public final class RootBridge {
                 }
             }
             if (completed) throw new IllegalStateException("镜像已安装，但恢复启动选择失败，请刷新检查：" + error.getMessage(), error);
+            checkpoint();
             throw error;
         }
+    }
+    interface ExportSource extends AutoCloseable {
+        long size();
+        java.io.InputStream input();
+        void close() throws Exception;
+    }
+    interface ExportOpener { ExportSource open(Object images, String name) throws Exception; }
+    private static ExportOpener exportOpener = RootBridge::openExport;
+    private static ExportSource openExport(Object images, String name) throws Exception {
+        Object mapping = Class.forName("android.gsi.MappedImage").getConstructor().newInstance();
+        boolean mapped = false;
+        try {
+            imageCall(images, "mapImageDevice", name, 10000, mapping); mapped = true;
+            String path = (String)mapping.getClass().getField("path").get(mapping);
+            if (!path.matches("/dev/block/dm-[0-9]+")) throw new SecurityException("非标准 DSU 块映射");
+            java.lang.Process query = new ProcessBuilder("/system/bin/blockdev", "--getsize64", path).redirectErrorStream(true).start();
+            long size;
+            try {
+                if (!query.waitFor(5, TimeUnit.SECONDS) || query.exitValue() != 0) throw new IllegalStateException("无法读取分区容量");
+                byte[] result = new byte[128]; int length = query.getInputStream().read(result);
+                size = Long.parseLong(new String(result, 0, Math.max(0, length), StandardCharsets.US_ASCII).trim());
+            } finally { query.destroy(); }
+            FileInputStream input = new FileInputStream(path);
+            final long bytes = size;
+            return new ExportSource() {
+                public long size() { return bytes; }
+                public java.io.InputStream input() { return input; }
+                public void close() throws Exception {
+                    try { input.close(); } finally { imageCall(images, "unmapImageDevice", name); }
+                }
+            };
+        } catch (Exception failure) {
+            if (mapped) try { imageCall(images, "unmapImageDevice", name); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
+    }
+    @SuppressWarnings("unchecked")
+    private static JSONObject exportPartition(String slot, String partition, OutputStream output) throws Exception {
+        idle(); if (!multi()) throw new IllegalStateException("分区提取需要 Android 11+ 和 Root"); validateSlot(slot);
+        if (!READ_ONLY.contains(partition) && !partition.equals("userdata")) throw new IllegalArgumentException("不支持提取此分区");
+        if (pendingPartitions(slot).contains(partition)) throw new IllegalStateException("此分区尚待修复，无法提取完整镜像");
+        Object images = call("openImageService", "dsu/" + slot);
+        String name = partition + "_gsi";
+        if (!((List<String>)imageCall(images, "getAllBackingImages")).contains(name)) throw new IllegalStateException("此分区不存在");
+        if (Boolean.TRUE.equals(imageCall(images, "isImageMapped", name))) throw new IllegalStateException("此分区正在使用或映射，暂不可提取");
+        checkpoint();
+        JSONObject result;
+        try (ExportSource source = exportOpener.open(images, name)) {
+            String hash = RawImageExport.copy(source.input(), output, source.size(), RootBridge::checkpoint,
+                (done, total) -> progress("提取 " + partition, done, total));
+            result = new JSONObject().put("bytes", source.size()).put("sha256", hash);
+        }
+        finishCancellation();
+        return result;
     }
     private static long readImageSize(Object images, String name) throws Exception {
         if (Boolean.TRUE.equals(imageCall(images, "isImageMapped", name))) return 0;
@@ -720,6 +828,7 @@ public final class RootBridge {
         return new JSONObject().put("entries", entries);
     }
     public static void main(String[] args) {
+        exportMode = args.length > 0 && args[0].equals("export");
         JSONObject out = new JSONObject();
         RandomAccessFile lockFile = null; java.nio.channels.FileLock lock = null;
         try {
@@ -739,6 +848,16 @@ public final class RootBridge {
             if (binder == null) throw new IllegalStateException("设备未提供 gsid 服务");
             api = Class.forName("android.gsi.IGsiService");
             service = Class.forName("android.gsi.IGsiService$Stub").getMethod("asInterface", IBinder.class).invoke(null, binder);
+            if (args.length > 0 && args[args.length - 1].equals("--cancellable")) {
+                args = Arrays.copyOf(args, args.length - 1);
+                if (!Arrays.asList("install-package", "export").contains(args[0])) throw new SecurityException("此操作不允许取消");
+                cancellationEnabled = true; acceptingCancellation = true;
+                Thread monitor = new Thread(() -> {
+                    try { System.in.read(); requestCancellation(); }
+                    catch (java.io.IOException closed) { requestCancellation(); }
+                }, "UltraDSU-cancel-monitor");
+                monitor.setDaemon(true); monitor.start();
+            }
             if (args.length > 0 && args[args.length - 1].equals("--assist")) {
                 args = Arrays.copyOf(args, args.length - 1);
                 if (!Arrays.asList("grow-info", "grow", "grow-rollback").contains(args[0]) || flag("isGsiRunning")) throw new SecurityException("不允许使用协作交接");
@@ -774,6 +893,7 @@ public final class RootBridge {
                 case "install-package":
                     installImages(args[1], readManifest(new File(args[2])), Long.parseLong(args[3])); break;
                 case "images": out = inventory(args[1]); break;
+                case "export": out = exportPartition(args[1], args[2], new java.io.FileOutputStream(java.io.FileDescriptor.out)); break;
                 case "userdata-backups": out = userdataBackups(null, null, null); break;
                 case "userdata-backup-delete": out = userdataBackups(args[1], args[2], args[3]); break;
                 case "replace": mutate(args[1], readManifest(new File(args[2])), 0); break;
@@ -785,13 +905,13 @@ public final class RootBridge {
             out.put("ok", true);
         } catch (Throwable e) {
             while (e instanceof InvocationTargetException && e.getCause() != null) e = e.getCause();
-            try { out.put("ok", false); out.put("error", e.getClass().getSimpleName() + ": " + e.getMessage()); }
+            try { out.put("ok", false); out.put("cancelled", e instanceof CancellationException); out.put("error", e.getClass().getSimpleName() + ": " + e.getMessage()); }
             catch (Exception ignored) { }
         } finally {
             NativeGrowthTools.clearAssistance();
             try { if (lock != null) lock.release(); if (lockFile != null) lockFile.close(); } catch (Exception ignored) { }
         }
-        System.out.println("ULTRADSU:" + out);
+        (exportMode ? System.err : System.out).println("ULTRADSU:" + out);
         System.exit(0);
     }
 }

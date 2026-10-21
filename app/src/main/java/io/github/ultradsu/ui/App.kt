@@ -78,13 +78,22 @@ private data class Confirmation(val title: String, val text: String, val action:
     var notificationSlot by remember { mutableStateOf<DsuSlot?>(null) }
     val context = LocalContext.current
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-        notificationSlot?.let(model::prepare); notificationSlot = null
+        notificationSlot?.let(model::install); notificationSlot = null
     }
     val prepare: (DsuSlot) -> Unit = { slot ->
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context,
                 Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             notificationSlot = slot; notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        } else model.prepare(slot)
+        } else model.install(slot)
+    }
+    var handledAdbTask by rememberSaveable { mutableStateOf("") }
+    LaunchedEffect(prep.taskId, prep.finishedAt, state.slots) {
+        if (prep.needsAdb && prep.finishedAt > 0 && prep.taskId != handledAdbTask) {
+            state.slots.firstOrNull { it.id == prep.id && it.state in listOf(SlotState.PREPARED, SlotState.SUBMITTED) }?.let {
+                handledAdbTask = prep.taskId
+                commandSlot = it
+            }
+        }
     }
     val locked = state.busy || prep.busy
     val canInstall = state.device.installerAvailable || (state.root && state.device.verified && state.device.multiSlot)
@@ -188,13 +197,14 @@ private data class Confirmation(val title: String, val text: String, val action:
                         }
                     }
                     items(state.slots, key = { it.id }) { slot ->
-                        SlotCard(slot, state, locked, onEdit = { editingId = slot.id }, onPrepare = { prepare(slot) },
+                        SlotCard(slot, state, locked, onEdit = { editingId = slot.id },
                             onInstall = {
-                                if (state.root) confirmation = Confirmation("安装 ${slot.displayName}",
-                                    "槽标识：${slot.slotName}\nuserdata：${slot.userdataGiB} GiB\n" + if (state.device.multiSlot)
-                                        "将直接创建独立槽并写入镜像，保留其他槽。安装过程请查看本应用通知，不会自动重启。"
-                                    else "将打开系统安装器；它会清理当前 DSU，确认前请备份需要的数据。") { model.install(slot) }
-                                else commandSlot = slot
+                                confirmation = Confirmation("安装 ${slot.displayName}",
+                                    "槽标识：${slot.slotName}\nuserdata：${slot.userdataGiB} GiB\n" +
+                                    "将自动准备镜像，单镜像写入 system，多镜像包按分区名写入。\n" +
+                                    if (state.root && state.device.multiSlot)
+                                        "随后创建独立槽并安装，保留其他槽。可在进度气泡中取消，不会自动重启。"
+                                    else "准备完成后${if (state.root) "打开系统安装器" else "显示 ADB 安装命令"}；系统安装器可能清理当前 DSU，请先备份。交给系统后请使用系统 DSU 通知取消。") { prepare(slot) }
                             }, onBoot = { bootSlot = slot }, onDelete = {
                                 confirmation = Confirmation("删除 ${slot.displayName}",
                                     if (slot.state in listOf(SlotState.DRAFT, SlotState.PREPARED)) "将删除本地配置与准备文件。"
@@ -356,7 +366,7 @@ private data class Confirmation(val title: String, val text: String, val action:
 }
 
 @Composable private fun SlotCard(slot: DsuSlot, state: AppState, locked: Boolean,
-    onEdit: () -> Unit, onPrepare: () -> Unit, onInstall: () -> Unit, onBoot: () -> Unit, onDelete: () -> Unit) {
+    onEdit: () -> Unit, onInstall: () -> Unit, onBoot: () -> Unit, onDelete: () -> Unit) {
     val installed = slot.state == SlotState.INSTALLED
     val safeLocal = slot.state in listOf(SlotState.DRAFT, SlotState.PREPARED)
     UCard {
@@ -378,9 +388,9 @@ private data class Confirmation(val title: String, val text: String, val action:
         if (slot.systemBytes > 0) UText("system  ${"%.2f".format(slot.systemBytes.toDouble() / GIB)} GiB", 13, color = mutedColor)
         if (slot.images.size > 1 && !installed) UText("分区清单：" + slot.images.joinToString { "${it.partition} (${"%.2f".format(it.bytes.toDouble() / GIB)} GiB)" }, 13, color = mutedColor)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (slot.state == SlotState.DRAFT) UButton("准备镜像", !locked && !state.device.running && !state.device.installing, true, onClick = onPrepare)
-            if (slot.state == SlotState.PREPARED || slot.state == SlotState.SUBMITTED) UButton(
-                if (!state.device.internalMultiSlot && slot.slotName != "dsu") "不支持内部命名槽" else if (state.root && state.device.multiSlot) "安装到此槽" else if (state.root) "系统安装" else "ADB 安装",
+            if (slot.state in listOf(SlotState.DRAFT, SlotState.PREPARED, SlotState.SUBMITTED) ||
+                (slot.state == SlotState.MISSING && slot.sourceUri.isNotBlank())) UButton(
+                if (!state.device.internalMultiSlot && slot.slotName != "dsu") "不支持内部命名槽" else "安装",
                 !locked && (state.device.internalMultiSlot || slot.slotName == "dsu") && (state.device.installerAvailable || (state.root && state.device.multiSlot)) && !state.device.running && !state.device.installing,
                 true, onClick = onInstall)
             if (state.root && installed) UButton("启动", !locked && !state.device.running && !state.device.installing, true, onClick = onBoot)

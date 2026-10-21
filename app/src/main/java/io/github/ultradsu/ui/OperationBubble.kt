@@ -99,6 +99,8 @@ internal fun OperationBubble(
                             UText(title, 13, true, modifier = Modifier.weight(1f), maxLines = 1)
                             UText(status, 12, true, color)
                         }
+                        if (service && busy && preparation.message.isNotBlank())
+                            UText(preparation.message, 12, color = mutedColor, maxLines = 2)
                         TaskProgressBar(fraction, busy, color)
                     }
                 }
@@ -128,7 +130,9 @@ internal fun OperationBubble(
                             "${progressBytes(preparation.bytes)} / ${progressBytes(preparation.totalBytes)}"
                         else "已处理 ${progressBytes(preparation.bytes)}", 13, color = mutedColor)
                     }
-                    if (service && busy && !preparation.installation) UButton("取消准备", onClick = onCancel)
+                    if (service && busy && preparation.cancellable) UButton(
+                        if (preparation.cancelling) "正在取消…" else if (preparation.installation) "取消安装" else if (preparation.title == "提取分区镜像") "取消提取" else "取消准备",
+                        enabled = !preparation.cancelling, onClick = onCancel)
                 }
             }
         }

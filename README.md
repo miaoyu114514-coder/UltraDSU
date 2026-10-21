@@ -2,7 +2,7 @@
 
 基于 Android DSU（Dynamic System Updates）的原生 Android 应用。最低 Android 10 / API 29，Kotlin + Jetpack Compose。
 
-当前预发布版本：**0.2.8-alpha.11**。[下载 Release](https://github.com/miaoyu114514-coder/UltraDSU/releases/tag/v0.2.8-alpha.11) · [Alpha 说明](docs/releases/v0.2.8-alpha.11.md)。仓库已公开，无需登录即可下载测试版。
+当前预发布版本：**0.2.8-alpha.13**。[下载 Release](https://github.com/miaoyu114514-coder/UltraDSU/releases/tag/v0.2.8-alpha.13) · [Alpha 说明](docs/releases/v0.2.8-alpha.13.md)。仓库已公开，无需登录即可下载测试版。
 
 ## 已实现
 
@@ -10,6 +10,9 @@
 - 设置 → 外观可独立开启并保存液态玻璃底栏。参考 BakaSU 的紧凑居中胶囊：64dp 高、每项 76dp，轻模糊与透镜折射，按住放大、拖动预览、松手切页及弹性回弹。Android 13+ 使用 AGSL 折射/色散，Android 12 仅模糊，Android 10/11 使用磨砂回退；两种 UI 均可使用。页首复用启动器图标的前景、背景与莫奈配色。
 - 沿用 DSU Sideloader 的手机/下载箭头图标，分离自适应图标前景和背景。Android 12+ 使用系统莫奈色，Android 13+ 支持启动器主题图标；Android 10/11 回退白底黑图。
 - 分别配置每个槽的 DSU 标识、本地显示名称、userdata 大小（GiB）；持久保存多个配置。
+- 准备和安装合并为“安装”：Root 模式自动连续处理，无 Root 准备后自动展示 ADB 命令。Root 新槽安装可在气泡或通知中取消，清理本次未完成槽并保留准备镜像；提交完成阶段等待启动选择恢复，不强杀进程。收起与展开的进度均显示正在分配、写入的分区。
+- Root 分区提取：槽编辑页逐分区保存完整 raw `.img`，直接流式写入系统文件选择器中的位置，显示进度、验证传输 SHA-256，支持取消与残留文件清理。userdata 为原始加密镜像，不能直接浏览；已映射、正在运行或待修复的目标不能提取。详见 [安装与镜像提取](docs/INSTALL_AND_EXPORT.md)。
+- 安装或分区替换确认成功后自动清理应用内准备副本，保留分区清单和容量信息。Root 刷新确认已安装的历史槽时也会清理旧副本；失败、取消、待提交或待修复任务保留文件。不删除原始镜像、压缩包、真实 DSU 分区及 userdata 备份。无 Root 提交系统安装器时不能确认完成，因此继续保留准备文件。
 - 导入 SAF 文件选择器中的 raw ext4 / EROFS 镜像，以及 ZIP、7z、TAR、GZ、XZ、BZ2 压缩格式（包括 tar.gz / tar.xz / tar.bz2）。流式检查、解包和重新打包，准确统计每个分区大小。
 - 单镜像包默认映射到 `system`；多镜像包按 `system.img`、`product.img`、`system_ext.img` 等文件名识别分区，写入前展示清单。不把多分区包误拆成多个 DSU 槽。
 - Root 槽内镜像管理：查看真实分区/容量，为指定分区选择替换文件，或导入多分区包统一写入。替换只重建选定分区，保留该槽其余分区和 userdata。
@@ -40,7 +43,7 @@
 ## 使用
 
 1. 安装 APK，在“系统槽”中新建配置，选择兼容的 GSI。
-2. 填写槽标识、显示名称和 userdata GiB，点击“准备镜像”。安装时还需 system + userdata 空间，系统有自己的额外预留要求。
+2. 填写槽标识、显示名称和 userdata GiB，点击“安装”，自动完成准备及后续安装。安装时还需 system + userdata 空间，系统有自己的额外预留要求。
 3. 无 Root：复制两行命令到配置好 ADB 的电脑，执行后在手机上确认。首次连接电脑需开启 USB 调试并授权。命令以 POSIX shell 的引号规则生成，建议在 Linux / macOS / WSL / Git Bash 中执行。
 4. 有 Root：设置中开启 Root，Android 15+ 点击“安装到此槽”并确认，应用将直接安装独立槽，进度在本应用和前台通知中显示。Android 11–14 仅允许无已有占用槽时安装默认 dsu；Android 10 仍使用系统安装器。
 5. 系统安装器的进度查看系统 DSU 通知；Root 内置安装的进度查看 UltraDSU。完成后刷新，再选择单次或持续启动。无 Root 使用系统通知启动。

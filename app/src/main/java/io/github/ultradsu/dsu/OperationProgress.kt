@@ -4,7 +4,8 @@ import org.json.JSONObject
 import java.util.Locale
 
 /** Counts always describe the named phase, never an estimated whole-task percentage. */
-data class OperationProgress(val message: String, val bytes: Long = 0, val totalBytes: Long = 0) {
+data class OperationProgress(val message: String, val bytes: Long = 0, val totalBytes: Long = 0,
+    val cancellable: Boolean? = null) {
     val fraction: Float?
         get() = if (totalBytes > 0 && bytes >= 0 && bytes <= totalBytes)
             (bytes.toDouble() / totalBytes).toFloat() else null
@@ -13,7 +14,8 @@ data class OperationProgress(val message: String, val bytes: Long = 0, val total
         fun fromBridge(payload: String): OperationProgress = runCatching {
             val json = JSONObject(payload)
             OperationProgress(json.getString("message"), json.optLong("bytes").coerceAtLeast(0),
-                json.optLong("totalBytes").coerceAtLeast(0))
+                json.optLong("totalBytes").coerceAtLeast(0),
+                if (json.has("cancellable")) json.getBoolean("cancellable") else null)
         }.getOrElse { OperationProgress(payload) }
     }
 }

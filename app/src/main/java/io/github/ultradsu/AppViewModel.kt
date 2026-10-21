@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.OpenableColumns
+import android.provider.DocumentsContract
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -193,7 +194,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 DsuSlot(slotName = it, displayName = it, userdataGiB = userdataGiB(it) ?: 0,
                     state = if (it in names) SlotState.INSTALLED else SlotState.INCOMPLETE)
             }
-            store.write(merged); merged
+            store.write(merged)
+            // Only a live Root status can confirm a submitted system install or
+            // migrate retained files from older app versions. Never trust the old label.
+            if (!device.installing && !preparation.value.busy) {
+                merged.filter { it.slotName in names }.forEach { slot ->
+                    runCatching { store.cleanupPrepared(slot.id, java.io.File(context.filesDir, "images"), installationConfirmed = true) }
+                        .onSuccess { if (it > 0) DebugLog.event("prepared-cleanup", "releasedBytes=$it") }
+                        .onFailure { DebugLog.event("prepared-cleanup", "Cleanup deferred; slot contents preserved", it) }
+                }
+            }
+            store.read()
         }
         DebugLog.rememberSlots(local)
         DebugLog.event("device", "multiSlot=${device.multiSlot} internalMultiSlot=${device.internalMultiSlot} running=${device.running} installing=${device.installing} slots=${local.size}")
@@ -269,26 +280,51 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }.onFailure { notify("请求已发出但本地状态保存失败：${it.message}") }
     }
     fun install(slot: DsuSlot) = operation("检查安装条件") {
-        val device = syncDevice()
+        val device = if (state.value.root) syncDevice() else state.value.device
+        check(slot.state in listOf(SlotState.DRAFT, SlotState.MISSING, SlotState.PREPARED, SlotState.SUBMITTED)) { "此槽状态不允许安装" }
         check(!device.running && !device.installing) { "请先返回主系统并等待当前 DSU 安装结束" }
         check(slot.slotName !in device.occupiedSlots) { "系统已有同名槽位或未完成的安装，已阻止覆盖" }
         check(device.multiSlot || device.occupiedSlots.isEmpty()) { "当前系统不支持多个 DSU 槽" }
         check(device.multiSlot || slot.slotName == "dsu") { "当前系统仅支持默认槽 dsu，请重新创建配置" }
-        if (device.multiSlot) {
+        if (state.value.root && device.multiSlot) {
             check(device.internalMultiSlot || (slot.slotName == "dsu" && device.occupiedSlots.isEmpty())) {
                 "此系统 gsid 不支持在内部存储新增命名槽；AOSP Android 15 起支持内部多槽。现有系统和准备镜像已保留，不能通过 Root 权限直接绕过此限制。"
             }
             context.startForegroundService(Intent(context, PreparationService::class.java)
-                .setAction("install").putExtra("slotId", slot.id))
+                .setAction("install-auto").putExtra("slotId", slot.id))
             return@operation
         }
         check(device.installerAvailable) { "系统 DSU 安装器不可用" }
-        val uri = preparedUri(slot)
-        val output = root.shell("setprop persist.sys.fflag.override.settings_dynamic_system true && " + Shell.install(uri.toString(), slot, Build.VERSION.SDK_INT))
-        check(!output.contains("Error:", true) && !output.contains("Exception", true) && output.contains("Status: ok", true)) {
-            "系统未确认启动安装器：${output.takeLast(1200)}"
+        check(device.internalMultiSlot || slot.slotName == "dsu") { "此系统不支持内部命名槽，请使用默认槽 dsu" }
+        context.startForegroundService(Intent(context, PreparationService::class.java)
+            .setAction(if (state.value.root) "install-legacy" else "prepare-install-adb").putExtra("slotId", slot.id))
+    }
+    fun exportPartition(slot: DsuSlot, partition: String, destination: Uri) {
+        viewModelScope.launch {
+            // Returning from DocumentsUI can trigger onResume's read-only refresh.
+            // Do not lose the newly created document while that refresh is finishing.
+            if (state.value.busy && state.value.operationLabel == "刷新系统槽") state.first { !it.busy }
+            if (state.value.busy || preparation.value.busy) {
+                runCatching { DocumentsContract.deleteDocument(context.contentResolver, destination) }
+                notify("已有任务正在处理，请完成后重新提取")
+                return@launch
+            }
+            operation("检查镜像提取条件") {
+                try {
+                    check(state.value.root && state.value.device.multiSlot) { "分区提取需要 Root 和 Android 11+" }
+                    check(partition in PartitionRules.readOnly || partition == "userdata") { "不支持提取此分区" }
+                    val device = syncDevice()
+                    check(!device.running && !device.installing) { "请先返回主系统并等待当前安装结束" }
+                    runCatching { context.contentResolver.takePersistableUriPermission(destination, Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
+                    context.startForegroundService(Intent(context, PreparationService::class.java).setAction("export")
+                        .putExtra("slotId", slot.id).putExtra("partition", partition).putExtra("destination", destination.toString()))
+                } catch (failure: Exception) {
+                    runCatching { DocumentsContract.deleteDocument(context.contentResolver, destination) }
+                    runCatching { context.contentResolver.releasePersistableUriPermission(destination, Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
+                    throw failure
+                }
+            }
         }
-        submitted(slot)
     }
     fun enable(slot: DsuSlot, sticky: Boolean, reboot: Boolean) = operation("设置启动槽") {
         root.bridge("enable", slot.slotName, if (sticky) "sticky" else "once")
